@@ -9,10 +9,14 @@
   "permissions": [
     {
       "name": "network",
-      "desc": "Reads the aircraft your Loops receiver hears through the HUD server on your own computer.",
+      "desc": "Reads the aircraft near you through the HUD server on your own computer.",
       "whitelist": [
         "http://192.0.2.1:5173"
       ]
+    },
+    {
+      "name": "location",
+      "desc": "Sends your phone's position to the HUD server on your own computer, so it can find what is around you. It goes nowhere else."
     }
   ],
   "supported_languages": [

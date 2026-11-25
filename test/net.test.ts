@@ -55,6 +55,12 @@ describe("connectServer", () => {
     expect(url.searchParams.get("k")).toBe("abc+def0123456789");
   });
 
+  it.each(["around", "sky"])("puts app=%s on the WebSocket URL, the parameter server/index.ts reads", (app) => {
+    page("?k=0123456789abcdef");
+    connectServer(() => undefined, () => undefined, app);
+    expect(new URL(FakeSocket.all[0]!.url).searchParams.get("app")).toBe(app);
+  });
+
   it("keeps the key on every reconnect", () => {
     page("?k=0123456789abcdef");
     const states: boolean[] = [];

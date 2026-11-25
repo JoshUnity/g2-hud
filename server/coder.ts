@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { existsSync, lstatSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { query, type HookCallback, type PermissionResult, type Query, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
@@ -144,6 +144,125 @@ export function agentGate(root: string): HookCallback {
   };
 }
 
+/** The lines of a text: none for "", else the number of lines (a final line break does not start another). */
+const lineCount = (text: unknown): number => (typeof text === "string" && text !== "" ? text.replace(/\n$/, "").split("\n").length : 0);
+
+/** The lines a file edit adds and removes, from its input (Edit, MultiEdit, Write, NotebookEdit); 0 and 0 for anything else. */
+export function editedLines(tool: string, input: Record<string, unknown>): { added: number; removed: number } {
+  switch (tool) {
+    case "Edit":
+      return { added: lineCount(input.new_string), removed: lineCount(input.old_string) };
+    case "MultiEdit": {
+      const edits = Array.isArray(input.edits) ? (input.edits as Record<string, unknown>[]) : [];
+      let added = 0;
+      let removed = 0;
+      for (const e of edits) {
+        added += lineCount(e?.new_string);
+        removed += lineCount(e?.old_string);
+      }
+      return { added, removed };
+    }
+    case "Write":
+      return { added: lineCount(input.content), removed: 0 };
+    case "NotebookEdit":
+      return { added: lineCount(input.new_source), removed: 0 };
+    default:
+      return { added: 0, removed: 0 };
+  }
+}
+
+/** Shell programs and sub-commands that reach the network. The note "needs network" is shown only for these, so it is never wrong the other way. */
+const NETWORK_COMMAND =
+  /(^|[\s;&|(`$])(curl|wget|ssh|scp|sftp|rsync|nc|ncat|telnet|ping|dig|nslookup|npx|pipx|git\s+(clone|fetch|pull|push)|npm\s+(install|i|ci|add|update|publish|view|info|audit)|pnpm\s+(install|i|add|update|dlx)|yarn(\s+(install|add|up|dlx))?|bun\s+(install|i|add|x)|pip3?\s+install|uv\s+(pip|add|sync)|cargo\s+(install|add|fetch|update|publish)|go\s+(get|install)|brew\s+(install|update|upgrade)|apt(-get)?\s+(install|update|upgrade)|docker\s+(pull|push|login)|gh)(\s|$)/;
+
+/** Whether a call clearly needs the network: the web tools, and shell commands that name a networked program. */
+export function needsNetwork(tool: string, input: Record<string, unknown>): boolean {
+  if (tool === "WebFetch" || tool === "WebSearch") return true;
+  return tool === "Bash" && typeof input.command === "string" && NETWORK_COMMAND.test(input.command);
+}
+
+/** The folder for the card: "~" for the home folder, and the tail when it is longer than the view allows (80). */
+export function shortFolder(root: string): string {
+  const home = homedir();
+  const text = root === home ? "~" : root.startsWith(home + sep) ? `~${root.slice(home.length)}` : root;
+  return text.length > 80 ? `…${text.slice(-79)}` : text;
+}
+
+/** The most files a view lists, and the longest path it may carry (the schema in src/core/protocol.ts refuses more). */
+export const MAX_FILES = 24;
+const MAX_PATH = 120;
+/**
+ * The project file a tool call touches: a path relative to the project root with "/" separators, and
+ * whether it was read or edited. Null for a call with no file, a folder, a path outside the project (links
+ * resolved), or a path longer than the view allows.
+ */
+export function touchedFile(tool: string, input: Record<string, unknown>, root: string): { path: string; state: "read" | "edit" } | null {
+  const state = FILE_EDITS.has(tool) ? "edit" : READS.has(tool) ? "read" : null;
+  if (!state) return null;
+  const target = input.file_path ?? input.notebook_path ?? input.path;
+  if (typeof target !== "string" || !target) return null;
+  const spot = landing(target, root);
+  if (!spot) return null;
+  const rel = spot.lexical.split(sep).join("/");
+  if (!rel || rel.startsWith("..") || isAbsolute(rel) || rel.length > MAX_PATH) return null;
+  // A search or a listing names a folder as often as a file; only a file is a touched file.
+  if (state === "read" && tool !== "Read" && tool !== "NotebookRead") {
+    try {
+      if (!statSync(join(root, rel)).isFile()) return null;
+    } catch {
+      return null;
+    }
+  }
+  return { path: rel, state };
+}
+
+/** Folders and files the tree count skips, and its limits: 3 levels deep, 200 files counted, 2000 entries looked at. */
+const TREE_SKIP = new Set(["node_modules"]);
+const TREE_DEPTH = 3;
+const TREE_COUNT = 200;
+const TREE_LOOKED = 2000;
+export const MAX_FOLDERS = 12;
+
+function countFiles(dir: string, depth: number, budget: { files: number; looked: number }): void {
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (budget.files >= TREE_COUNT || budget.looked >= TREE_LOOKED) return;
+    if (entry.name.startsWith(".") || TREE_SKIP.has(entry.name)) continue;
+    budget.looked++;
+    if (entry.isFile()) budget.files++;
+    else if (entry.isDirectory() && depth < TREE_DEPTH) countFiles(join(dir, entry.name), depth + 1, budget);
+  }
+}
+
+/**
+ * The top-level folders of a project with a file count each, for the file map: no hidden folders, no
+ * node_modules, no links. At most MAX_FOLDERS (the fullest ones), in name order. Cheap by design.
+ */
+export function projectTree(root: string): { name: string; files: number }[] {
+  let entries;
+  try {
+    entries = readdirSync(root, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const folders = entries
+    .filter((e) => e.isDirectory() && !e.name.startsWith(".") && !TREE_SKIP.has(e.name) && e.name.length <= 40)
+    .map((e) => {
+      const budget = { files: 0, looked: 0 };
+      countFiles(join(root, e.name), 1, budget);
+      return { name: e.name, files: budget.files };
+    });
+  return folders
+    .sort((a, b) => b.files - a.files || a.name.localeCompare(b.name))
+    .slice(0, MAX_FOLDERS)
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
 const clip = (text: string, max: number) => {
   const one = text.replace(/\s+/g, " ").trim();
   return one.length > max ? one.slice(0, max - 1) + "…" : one;
@@ -192,11 +311,14 @@ export const APPROVAL_TEXT_MAX = 3000;
 /**
  * Every character the glasses can draw; the rest is shown as \u{…}, because the font drops unknown glyphs silently.
  * The firmware font has no backtick (U+0060), so a backtick (shell command substitution) shows as \u{60}.
+ * A real backslash that starts what looks like such an escape ("\u{") shows as \u{5c}, so typed text can never pass for
+ * an escape: every "\u{" the wearer reads is one this function wrote.
  */
 const visible = (text: string) =>
   text
     .replace(/\r\n?/g, "\n")
     .replace(/\t/g, " ")
+    .replace(/\\(?=u\{)/g, "\\u{5c}")
     .replace(/[^\x20-\x5f\x61-\x7e\n]/gu, (ch) => `\\u{${ch.codePointAt(0)!.toString(16)}}`);
 
 /**
@@ -214,23 +336,35 @@ export function approvalText(tool: string, input: Record<string, unknown>, root:
     if (real === null) return `${shown} → (broken link)`;
     return real === full ? shown : `${shown} → ${visible(real)}`;
   };
+  /**
+   * The card is the whole call: every input key that the summary above does not show follows it, as
+   * "name: value". A tap must never allow a call that differs from what was read (a background run, a
+   * timeout, a sandbox switch, the prompt of a fetch).
+   */
+  const rest = (...shown: string[]) =>
+    Object.entries(input)
+      .filter(([key]) => !shown.includes(key))
+      .map(([key, value]) => `\n${visible(key)}: ${visible(typeof value === "string" ? value : (JSON.stringify(value) ?? String(value)))}`)
+      .join("");
+  /** The keys whose string value the summary shows (a key of another type is not shown, so it is listed in `rest`). */
+  const text = (...keys: string[]) => keys.filter((key) => typeof input[key] === "string");
   switch (tool) {
     case "Bash":
-      return `$ ${visible(str("command"))}`;
+      return `$ ${visible(str("command"))}${rest(...text("command"))}`;
     case "Write": // the content too: a hook or an MCP server is written in it
-      return `Write ${path("file_path")}\n${visible(str("content"))}`;
+      return `Write ${path("file_path")}\n${visible(str("content"))}${rest(...text("file_path", "content"))}`;
     case "Edit": // replace_all changes every match, not one
-      return `Edit ${path("file_path")}${input.replace_all === true ? " (every match)" : ""}\n- ${visible(str("old_string"))}\n+ ${visible(str("new_string"))}`;
+      return `Edit ${path("file_path")}${input.replace_all === true ? " (every match)" : ""}\n- ${visible(str("old_string"))}\n+ ${visible(str("new_string"))}${rest(...text("file_path", "old_string", "new_string"), ...(input.replace_all === true ? ["replace_all"] : []))}`;
     case "MultiEdit":
     case "Read":
-      return `${tool} ${path("file_path")}${Array.isArray(input.edits) ? `\n${visible(JSON.stringify(input.edits))}` : ""}`;
+      return `${tool} ${path("file_path")}${Array.isArray(input.edits) ? `\n${visible(JSON.stringify(input.edits))}` : ""}${rest(...text("file_path"), ...(Array.isArray(input.edits) ? ["edits"] : []))}`;
     case "NotebookEdit": {
       // The cell and the source it gets (an insert adds a new cell after cell_id).
       const cell = [str("edit_mode") || "replace", "cell", str("cell_id"), str("cell_type") && `(${str("cell_type")})`].filter(Boolean).join(" ");
-      return `Edit ${path("notebook_path")}\n${visible(cell)}\n${visible(str("new_source"))}`;
+      return `Edit ${path("notebook_path")}\n${visible(cell)}\n${visible(str("new_source"))}${rest(...text("notebook_path", "edit_mode", "cell_id", "cell_type", "new_source"))}`;
     }
     case "WebFetch":
-      return `Fetch ${visible(str("url"))}`;
+      return `Fetch ${visible(str("url"))}${rest(...text("url"))}`;
     default:
       return visible(`${tool} ${JSON.stringify(input)}`);
   }
@@ -274,6 +408,8 @@ export class Coder {
   /** Requests wait here for their turn: the glasses show one at a time. */
   private approvals: Promise<unknown> = Promise.resolve();
   view: CodeView;
+  /** The project folder as the card shows it. */
+  private readonly folder: string;
 
   constructor(
     dir: string,
@@ -291,12 +427,27 @@ export class Coder {
       stats: "",
       error: "",
       startedAt: null,
+      files: [],
+      current: null,
+      tree: projectTree(this.root),
     };
+    this.folder = shortFolder(this.root);
   }
 
   private set(patch: Partial<CodeView>): void {
     this.view = { ...this.view, ...patch };
     this.onChange(this.view);
+  }
+
+  /** Notes a file the task touched: once, in the order first touched, with the stronger state, and the newest MAX_FILES. */
+  private touch(file: { path: string; state: "read" | "edit" }): void {
+    const files = this.view.files ?? [];
+    const at = files.findIndex((f) => f.path === file.path);
+    const next =
+      at < 0
+        ? [...files, file].slice(-MAX_FILES)
+        : files.map((f, i) => (i === at && file.state === "edit" ? { ...f, state: "edit" as const } : f));
+    this.set({ files: next, current: file.path });
   }
 
   private addLog(line: string): void {
@@ -322,7 +473,7 @@ export class Coder {
     this.abort = abort;
     // Ends approval requests still waiting when the run ends.
     const ended = new AbortController();
-    this.set({ state: "working", prompt, log: [], result: "", stats: "", error: "", approval: null, startedAt: Date.now() });
+    this.set({ state: "working", prompt, log: [], result: "", stats: "", error: "", approval: null, startedAt: Date.now(), files: [], current: null, added: 0, removed: 0 });
     const q = query({
       prompt,
       options: {
@@ -347,13 +498,13 @@ export class Coder {
     } catch (error) {
       if (!abort.signal.aborted) {
         log.error("coder run failed", { error: String(error) });
-        this.set({ state: "error", error: error instanceof Error ? error.message : String(error) });
+        this.set({ state: "error", error: error instanceof Error ? error.message : String(error), current: null });
       }
     } finally {
       this.running = null;
       this.abort = null;
       ended.abort();
-      if (abort.signal.aborted) this.set({ state: "done", approval: null, result: this.view.result || "Stopped.", stats: await this.stats() });
+      if (abort.signal.aborted) this.set({ state: "done", approval: null, current: null, result: this.view.result || "Stopped.", stats: await this.stats() });
     }
   }
 
@@ -372,7 +523,15 @@ export class Coder {
     if (message.type === "assistant") {
       for (const block of message.message.content) {
         if (block.type === "text" && block.text.trim()) this.addLog(clip(block.text, 120));
-        else if (block.type === "tool_use") this.addLog(`› ${describeTool(block.name, (block.input ?? {}) as Record<string, unknown>, this.root)}`);
+        else if (block.type === "tool_use") {
+          const input = (block.input ?? {}) as Record<string, unknown>;
+          this.addLog(`› ${describeTool(block.name, input, this.root)}`);
+          // A call with no file (a shell command) leaves the current file as it was: the work is still on it.
+          const file = touchedFile(block.name, input, this.root);
+          if (file) this.touch(file);
+          const edited = editedLines(block.name, input);
+          if (edited.added || edited.removed) this.set({ added: (this.view.added ?? 0) + edited.added, removed: (this.view.removed ?? 0) + edited.removed });
+        }
       }
       return;
     }
@@ -384,6 +543,7 @@ export class Coder {
         this.set({
           state: failed ? "error" : "done",
           approval: null,
+          current: null,
           result: result || (failed ? "" : "Done."),
           error: failed ? `Stopped: ${message.subtype.replace(/_/g, " ")}` : "",
           stats,
@@ -411,7 +571,10 @@ export class Coder {
     if (signal.aborted) return denied;
     const id = this.nextId++;
     const summary = describeTool(tool, input, this.root);
-    this.set({ state: "approval", approval: { id, summary, text } });
+    this.set({
+      state: "approval",
+      approval: { id, summary, text, tool: tool.toUpperCase().slice(0, 24), cwd: this.folder, ...(needsNetwork(tool, input) ? { network: true } : {}) },
+    });
     const allow = await new Promise<boolean>((resolveDecision) => {
       const timer = setTimeout(() => resolveDecision(false), APPROVAL_TIMEOUT_MS);
       signal.addEventListener("abort", () => resolveDecision(false), { once: true });
@@ -446,6 +609,6 @@ export class Coder {
   reset(): void {
     if (this.running) return;
     this.sessionId = null;
-    this.set({ state: "idle", prompt: "", log: [], result: "", stats: "", error: "", approval: null, startedAt: null });
+    this.set({ state: "idle", prompt: "", log: [], result: "", stats: "", error: "", approval: null, startedAt: null, files: [], current: null, tree: projectTree(this.root), added: undefined, removed: undefined });
   }
 }

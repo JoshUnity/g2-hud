@@ -66,13 +66,17 @@ export function buildMessages(history: Turn[], prompt: string, now: Date, userNa
 
 const ChunkSchema = z.object({
   choices: z.array(z.object({ delta: z.object({ content: z.string().nullish() }).optional() })),
+  /** The backend's own token count so far. vLLM sends it in every chunk with `continuous_usage_stats`; Ollama only at the end. */
+  usage: z.object({ completion_tokens: z.number().int().min(0) }).nullish(),
 });
 
 /** Reads the complete lines of an OpenAI-style event stream; `rest` is the unfinished tail. */
-export function parseSse(buffer: string): { deltas: string[]; done: boolean; rest: string } {
+export function parseSse(buffer: string): { deltas: string[]; completionTokens: number[]; done: boolean; rest: string } {
   const lines = buffer.split("\n");
   const rest = lines.pop() ?? "";
   const deltas: string[] = [];
+  /** `usage.completion_tokens` of each chunk that reports it, in order. */
+  const completionTokens: number[] = [];
   let done = false;
   for (const raw of lines) {
     const line = raw.trim();
@@ -91,13 +95,20 @@ export function parseSse(buffer: string): { deltas: string[]; done: boolean; res
     const parsed = ChunkSchema.safeParse(json);
     const text = parsed.success ? parsed.data.choices[0]?.delta?.content : null;
     if (text) deltas.push(text);
+    const used = parsed.success ? parsed.data.usage?.completion_tokens : undefined;
+    if (used !== undefined) completionTokens.push(used);
   }
-  return { deltas, done, rest };
+  return { deltas, completionTokens, done, rest };
 }
 
-export function answerStats(answer: string, ms: number): string {
-  const words = answer.trim().split(/\s+/).filter(Boolean).length;
-  return `${words} ${words === 1 ? "word" : "words"}  ·  ${Math.max(1, Math.round(ms / 1000))}s`;
+/**
+ * The stats line under a finished answer: the generation time (first token to last, not the wait for the GPU)
+ * and the backend's own count of generated tokens, e.g. "2.1 s  ·  96 tokens". A backend that reports no count
+ * gives the time only; words are never shown as tokens.
+ */
+export function answerStats(ms: number, tokens: number | null): string {
+  const time = `${(Math.max(0, ms) / 1000).toFixed(1)} s`;
+  return tokens === null ? time : `${time}  ·  ${tokens} ${tokens === 1 ? "token" : "tokens"}`;
 }
 
 /**
@@ -146,9 +157,15 @@ const blankView = (): HackView => ({
   history: [],
 });
 
+/** The speed samples, at most this many (the lens draws 22 bars). Each is tokens per second from the backend's own counts. */
+export const RATE_SAMPLES = 22;
+const RATE_WINDOW_MS = 1000;
+
 /** The one conversation, shared by every connection, so a reconnect keeps it. */
 export class HackBrain {
   view: HackView = blankView();
+  /** False once the backend has refused `continuous_usage_stats`; kept for the session. */
+  private continuousUsage = true;
   private listeners = new Set<(view: HackView) => void>();
   private abort: AbortController | null = null;
   private pushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -202,20 +219,20 @@ export class HackBrain {
     this.abort = controller;
     const started = Date.now();
     const context = this.view.history;
-    this.set({ state: "thinking", prompt, answer: "", stats: "", error: "", startedAt: started });
+    this.set({ state: "thinking", prompt, answer: "", stats: "", error: "", startedAt: started, rate: [] });
     const wakeTimer = setTimeout(() => {
-      if (this.abort === controller && this.view.state === "thinking") this.set({ state: "waking" });
+      if (this.abort === controller && this.view.state === "thinking") this.set({ state: "waking", startedAt: Date.now() });
     }, WAKING_AFTER_MS);
     try {
       const response = await this.open(buildMessages(context, prompt, new Date()), controller.signal, started);
       clearTimeout(wakeTimer);
-      const answer = await this.read(response, controller.signal);
+      const { answer, tokens, generatedMs } = await this.read(response, controller.signal);
       if (controller.signal.aborted) return;
       if (!answer.trim()) throw new HackError("The model returned no text. Ask again.");
       this.set({
         state: "done",
         answer,
-        stats: answerStats(answer, Date.now() - started),
+        stats: answerStats(generatedMs, tokens),
         startedAt: null,
         history: [...context, { prompt, answer }].slice(-MAX_TURNS),
       });
@@ -233,8 +250,10 @@ export class HackBrain {
   /** Sends the request, and keeps trying while a sleeping GPU starts. */
   private async open(messages: ChatMessage[], signal: AbortSignal, started: number): Promise<Response> {
     const key = apiKey();
-    const body = JSON.stringify({ model: MODEL, messages, stream: true, ...(REASONING ? { reasoning_effort: REASONING } : {}) });
     for (;;) {
+      // Asks for the token count in every chunk (vLLM). A backend that rejects the option gets the plain request, for the session.
+      const streamOptions = this.continuousUsage ? { include_usage: true, continuous_usage_stats: true } : { include_usage: true };
+      const body = JSON.stringify({ model: MODEL, messages, stream: true, stream_options: streamOptions, ...(REASONING ? { reasoning_effort: REASONING } : {}) });
       let status = 0;
       // The limit covers the wait for a reply (and an error body) only. A timeout signal on
       // fetch stays armed on the body, and would cut an answer that is still streaming.
@@ -251,6 +270,10 @@ export class HackBrain {
         status = response.status;
         const detail = (await response.text().catch(() => "")).slice(0, 200);
         log.warn("hackos server answered", { status, detail });
+        if (this.continuousUsage && status >= 400 && status < 500 && /stream_options|continuous_usage_stats/i.test(detail)) {
+          this.continuousUsage = false;
+          continue;
+        }
         if (status === 401 || status === 403) {
           cachedKey = null; // read the key again on the next message, so a corrected key works without a restart
           throw new HackError("The model server rejected the API key. Check the key in the Keychain.");
@@ -266,18 +289,28 @@ export class HackBrain {
       if (Date.now() - started > WAKE_BUDGET_MS) {
         throw new HackError(`The GPU did not start in ${Math.round(WAKE_BUDGET_MS / 60_000)} minutes${status ? ` (HTTP ${status})` : ""}. Try again.`);
       }
-      if (this.view.state === "thinking") this.set({ state: "waking" });
+      if (this.view.state === "thinking") this.set({ state: "waking", startedAt: Date.now() });
       await sleep(RETRY_PAUSE_MS, signal);
       if (signal.aborted) throw new Error("stopped");
     }
   }
 
-  private async read(response: Response, signal: AbortSignal): Promise<string> {
+  private async read(response: Response, signal: AbortSignal): Promise<{ answer: string; tokens: number | null; generatedMs: number }> {
     const reader = (response.body as ReadableStream<Uint8Array>).getReader();
     const decoder = new TextDecoder();
     let buffer = "";
     let answer = "";
     let stalled = false;
+    // Speed samples for the lens, from the token counts the backend reports during the stream (never from chunks):
+    // the growth of `completion_tokens` between two reports at least RATE_WINDOW_MS apart. A backend that reports
+    // a count only at the end gives no sample, so the lens shows no speed.
+    const rate: number[] = [];
+    let lastTokens: number | null = null;
+    let lastAt = Date.now();
+    // The generation time runs from the first token to the last, and the count is the last one reported.
+    let firstTokenAt: number | null = null;
+    let lastTokenAt = 0;
+    let reportedTokens: number | null = null;
     for (;;) {
       // No bytes for ATTEMPT_MS: the stream has stalled. cancel() ends the pending read with done.
       const idle = setTimeout(() => {
@@ -290,13 +323,33 @@ export class HackBrain {
       // At the end, flush the decoder and close the last line, so a final line without a newline still counts.
       const parsed = parseSse(buffer + (done ? decoder.decode() + "\n" : decoder.decode(value, { stream: true })));
       buffer = parsed.rest;
+      const reported = parsed.completionTokens.at(-1);
+      if (reported !== undefined) reportedTokens = reported;
+      if (parsed.deltas.length > 0) {
+        firstTokenAt ??= Date.now();
+        lastTokenAt = Date.now();
+      }
+      if (reported !== undefined) {
+        const now = Date.now();
+        if (lastTokens === null) {
+          lastTokens = reported;
+          lastAt = now;
+        } else if (now - lastAt >= RATE_WINDOW_MS) {
+          if (reported > lastTokens) {
+            rate.push(((reported - lastTokens) * 1000) / (now - lastAt));
+            if (rate.length > RATE_SAMPLES) rate.shift();
+          }
+          lastTokens = reported;
+          lastAt = now;
+        }
+      }
       if (parsed.deltas.length > 0) {
         answer += parsed.deltas.join("");
-        this.set({ state: "answering", answer }, this.view.state !== "answering");
+        this.set({ state: "answering", answer, rate: [...rate] }, this.view.state !== "answering");
       }
       if (done || parsed.done) break;
     }
-    return answer;
+    return { answer, tokens: reportedTokens, generatedMs: firstTokenAt === null ? 0 : lastTokenAt - firstTokenAt };
   }
 }
 

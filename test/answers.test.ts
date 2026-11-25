@@ -367,7 +367,7 @@ function fakeHost(options: HostOptions = {}) {
         listener = null;
       };
     },
-    // The Sigil loop sends one frame and then waits for ever: images are not under test.
+    // The image loop sends one frame and then waits for ever: images are not under test.
     updateImageRawData: () => new Promise(() => undefined),
     textContainerUpgrade: async (u: Upgrade) => {
       upgrades.push(u);
@@ -432,7 +432,7 @@ async function bootPage(search: string, options: HostOptions = {}): Promise<Fake
   return socket;
 }
 
-const KEY = "?k=0123456789abcdef";
+const KEY = "?k=0123456789abcdef&intro=0";
 
 async function answer(socket: FakeSocket, id: number, question: string, text: string): Promise<void> {
   socket.message({ type: "utterance", text: question, speaker: "other" });
@@ -455,16 +455,16 @@ describe("Answers glasses page", () => {
   it("keeps a finished answer when the next remark is not a question", async () => {
     const socket = (await bootPage(KEY))!;
     await answer(socket, 1, "How is it priced?", "- It is priced per seat.");
-    expect(host.glasses.get("card")).toBe("• It is priced per seat.");
+    expect(host.glasses.get("body")).toBe("• It is priced per seat.");
     socket.message({ type: "utterance", text: "Okay, that makes sense.", speaker: "other" });
     socket.message({ type: "thinking", id: 2 });
     await vi.advanceTimersByTimeAsync(500);
-    expect(host.glasses.get("card")).toBe("• It is priced per seat.");
+    expect(host.glasses.get("body")).toBe("• It is priced per seat.");
     expect(host.glasses.get("question")).toBe("“How is it priced?”");
     socket.message({ type: "answer_none", id: 2 });
     await vi.advanceTimersByTimeAsync(500);
-    expect(host.glasses.get("status")).toBe("ANSWER");
-    expect(host.glasses.get("card")).toBe("• It is priced per seat.");
+    expect(host.glasses.get("status")).toBe("Answer");
+    expect(host.glasses.get("body")).toBe("• It is priced per seat.");
   });
 
   it("drops the rest of a streaming answer after a double tap", async () => {
@@ -477,8 +477,8 @@ describe("Answers glasses page", () => {
     socket.message({ type: "answer_delta", id: 1, text: " with a yearly contract." });
     socket.message({ type: "answer_done", id: 1 });
     await vi.advanceTimersByTimeAsync(500);
-    expect(host.glasses.get("card")).toContain("Listening for questions");
-    expect(host.glasses.get("status")).toBe("LISTENING");
+    expect(host.glasses.get("hint")).toContain("Tap pause");
+    expect(host.glasses.get("status")).toBe("Listening");
   });
 
   it("sends a text box again after the host refused the upgrade once", async () => {
@@ -495,12 +495,12 @@ describe("Answers glasses page", () => {
     await answer(socket, 1, "What does it cost?", "- About forty dollars per seat.");
     expect(refused).toBe(true);
     await vi.advanceTimersByTimeAsync(1500);
-    expect(host.glasses.get("card")).toBe("• About forty dollars per seat.");
+    expect(host.glasses.get("body")).toBe("• About forty dollars per seat.");
   });
 
   it("runs one text upgrade at a time, so a slow upgrade cannot put old text on the glasses", async () => {
     const socket = (await bootPage(KEY, {
-      upgrade: (u) => (u.content?.startsWith("ANSWER") ? new Promise((resolve) => setTimeout(() => resolve(true), 400)) : true),
+      upgrade: (u) => (u.content?.startsWith("Answer") ? new Promise((resolve) => setTimeout(() => resolve(true), 400)) : true),
     }))!;
     socket.message({ type: "thinking", id: 1 });
     socket.message({ type: "answer_start", id: 1, question: "What does it cost?" });
@@ -509,7 +509,7 @@ describe("Answers glasses page", () => {
     socket.message({ type: "answer_delta", id: 1, text: " about forty dollars per seat." });
     socket.message({ type: "answer_done", id: 1 });
     await vi.advanceTimersByTimeAsync(3000);
-    expect(host.glasses.get("card")).toBe("• Yes, about forty dollars per seat.");
+    expect(host.glasses.get("body")).toBe("• Yes, about forty dollars per seat.");
     expect(host.maxInFlight()).toBe(1);
   });
 
@@ -517,7 +517,7 @@ describe("Answers glasses page", () => {
     let hung = false;
     const socket = (await bootPage(KEY, {
       upgrade: (u) => {
-        if (!hung && u.containerName === "status" && u.content === "ANSWER") {
+        if (!hung && u.containerName === "status" && u.content === "Answer") {
           hung = true;
           return new Promise(() => undefined);
         }
@@ -526,15 +526,15 @@ describe("Answers glasses page", () => {
     }))!;
     await answer(socket, 1, "Where are you based?", "- In London.");
     await vi.advanceTimersByTimeAsync(5000);
-    expect(host.glasses.get("card")).toBe("• In London.");
-    expect(host.glasses.get("status")).toBe("ANSWER");
+    expect(host.glasses.get("body")).toBe("• In London.");
+    expect(host.glasses.get("status")).toBe("Answer");
   });
 
-  it("shows PAUSED, not LISTENING, when the glasses microphone does not open", async () => {
+  it("shows Paused, not Listening, when the glasses microphone does not open", async () => {
     const socket = (await bootPage(KEY, { audio: () => false }))!;
     expect(host.audio).toEqual([true]);
     await vi.advanceTimersByTimeAsync(9000);
-    expect(host.glasses.get("status")).toBe("PAUSED");
+    expect(host.glasses.get("status")).toBe("Paused");
     host.frame();
     expect(socket.binaryFrames()).toBe(0);
     host.gesture(OsEventTypeList.CLICK_EVENT);
@@ -549,7 +549,7 @@ describe("Answers glasses page", () => {
     expect(host.audio).toEqual([true, true]);
     await vi.advanceTimersByTimeAsync(15_000);
     expect(host.audio).toEqual([true, true, false]);
-    expect(host.glasses.get("status")).toContain("MIC NOT AVAILABLE");
+    expect(host.glasses.get("status")).toContain("Mic not available");
   });
 
   it("leaves the microphone alone while audio flows", async () => {
@@ -582,9 +582,9 @@ describe("Answers glasses page", () => {
     const acks = () => socket.sent.filter((d) => typeof d === "string" && (JSON.parse(d) as { type: string }).type === "recall_shown");
     socket.message({ type: "recall", name: "Sarah Chen", facts });
     await vi.advanceTimersByTimeAsync(500);
-    expect(host.glasses.get("question")).toBe("SARAH CHEN  ·  12 Nov  ·  Pricing plan with Sarah\nOpen: Send the deck  ·  Head of procurement, Northwin…");
-    expect(host.glasses.get("status")).toBe("LISTENING");
-    expect(host.glasses.get("card")).toContain("Listening for questions");
+    expect(host.glasses.get("question")).toBe("SARAH CHEN  ·  12 Nov  ·  Pricing plan with Sarah\nOpen: Send the deck  ·  Head of procurement, Northwind.");
+    expect(host.glasses.get("status")).toBe("Listening");
+    expect(host.glasses.get("hint")).toContain("Tap pause");
     expect(acks()).toEqual([]);
     await vi.advanceTimersByTimeAsync(3000);
     expect(acks()).toEqual([JSON.stringify({ type: "recall_shown", name: "Sarah Chen" })]);
@@ -593,6 +593,38 @@ describe("Answers glasses page", () => {
     expect(acks()).toHaveLength(1);
     expect(created.filter((e) => e.className === "recall").map((e) => e.textContent)).toEqual(["Recall: Sarah Chen"]);
     expect(created.some((e) => facts.some((f) => e.textContent.includes(f)))).toBe(false);
+  });
+
+  it("opens the socket as the Answers app, so the server sends the vault graph", async () => {
+    await bootPage(KEY);
+    expect(FakeSocket.all[0]?.url).toContain("app=answers");
+  });
+
+  it("shows the recall view in the card when the graph has the person, acknowledges it after 3 s on the card, and logs only the name", async () => {
+    const socket = (await bootPage(KEY))!;
+    const card = { lead: "Head of procurement, Northwind", met: 4, seen: "12 Nov", last: "12 Nov  ·  Pricing plan", open: "Send the deck" };
+    const facts = ["12 Nov  ·  Pricing plan", "Open: Send the deck", "Head of procurement"];
+    const acks = () => socket.sent.filter((d) => typeof d === "string" && (JSON.parse(d) as { type: string }).type === "recall_shown");
+    socket.message({
+      type: "vault_graph",
+      nodes: [{ id: 5, title: "Sarah Chen", kind: "person" }, { id: 6, title: "Pricing plan", kind: "topic" }],
+      links: [[5, 6]],
+      total: { notes: 214, people: 11 },
+    });
+    socket.message({ type: "recall", name: "Sarah Chen", facts, id: 5, card });
+    await vi.advanceTimersByTimeAsync(500);
+    expect(["card1", "card2", "card3", "card4"].map((n) => host.glasses.get(n))).toEqual(["Head of procurement", "Northwind  ·  met 4 times", "12 Nov  ·  Pricing plan", "Send the deck"]);
+    expect(host.glasses.get("status")).toBe("Recall");
+    expect(host.glasses.get("question")).toBe("");
+    expect(host.glasses.get("body")).toBe("");
+    expect(host.glasses.get("hint")).toBe("");
+    expect(acks()).toEqual([]);
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(acks()).toEqual([JSON.stringify({ type: "recall_shown", name: "Sarah Chen" })]);
+    await vi.advanceTimersByTimeAsync(7000);
+    expect(host.glasses.get("card1")).toBe("");
+    expect(host.glasses.get("hint")).toContain("Tap pause");
+    expect(created.some((e) => facts.some((f) => e.textContent.includes(f)) || e.textContent.includes("Pricing plan") || e.textContent.includes("procurement"))).toBe(false);
   });
 
   it("does not acknowledge a recall cue that the glasses never took", async () => {
@@ -610,23 +642,23 @@ describe("Answers glasses page", () => {
     expect(host.upgrades).toEqual([]);
     await vi.advanceTimersByTimeAsync(1000);
     expect(host.early()).toBe(0);
-    expect(host.glasses.get("status")).toBe("LISTENING");
+    expect(host.glasses.get("status")).toBe("Listening");
   });
 
   it("draws a state change from while the page was created, even when the microphone start hangs", async () => {
     // The greeting (CONNECTING to LISTENING) arrives before the page exists; audioControl never answers.
     await bootPage(KEY, { createMs: 800, audio: () => new Promise<boolean>(() => undefined) });
     await vi.advanceTimersByTimeAsync(1000);
-    expect(host.glasses.get("status")).toBe("LISTENING");
+    expect(host.glasses.get("status")).toBe("Listening");
   });
 
-  it("keeps PAUSED on the lens when the server greets a reconnect while the microphone is off", async () => {
+  it("keeps Paused on the lens when the server greets a reconnect while the microphone is off", async () => {
     const socket = (await bootPage(KEY, { audio: () => false }))!;
     await vi.advanceTimersByTimeAsync(9000);
-    expect(host.glasses.get("status")).toBe("PAUSED");
+    expect(host.glasses.get("status")).toBe("Paused");
     socket.message({ type: "status", text: "Listening…" });
     await vi.advanceTimersByTimeAsync(500);
-    expect(host.glasses.get("status")).toBe("PAUSED");
+    expect(host.glasses.get("status")).toBe("Paused");
     // Other server news still shows.
     socket.message({ type: "status", text: "Nothing to save yet." });
     await vi.advanceTimersByTimeAsync(500);
@@ -651,6 +683,6 @@ describe("Answers glasses page", () => {
     expect(elements.get("ask")?.removed).toBe(true);
     expect(elements.get("status")?.textContent).toBe("Demo scene: answer");
     // The demo takes the host it was given; let it draw before the next test sets up a new host.
-    await vi.waitFor(() => expect(host.glasses.get("card")).toContain("route planner"));
+    await vi.waitFor(() => expect(host.glasses.get("body")).toContain("route planner"));
   });
 });

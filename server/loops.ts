@@ -56,6 +56,8 @@ const AircraftSchema = z.object({
   on_ground: z.boolean().optional(),
   track: z.number().nullable().optional(),
   speed_kt: z.number().nullable().optional(),
+  /** Feet per minute, positive = climbing. A malformed value is ignored, not fatal to the aircraft. */
+  vertical_fpm: z.number().nullable().optional().catch(undefined),
   emergency: z.boolean().optional(),
   trail: z.array(LatLon).optional(),
 });
@@ -66,9 +68,42 @@ const LoopsMapSchema = z.object({
   roads: z.array(z.object({ class: z.string(), points: z.array(LatLon) })),
   water: z.array(z.array(LatLon)),
   green: z.array(z.array(LatLon)),
+  /** Kept loose: a bad building must not cost the roads, so entries are checked one by one in `parseLoopsMap`. */
+  buildings: z.array(z.unknown()).optional().catch(undefined),
   /** false while Loops is still fetching map tiles (it answers with what it has). */
   complete: z.boolean().optional(),
 });
+
+const BuildingSchema = z.object({ points: z.array(LatLon).min(4).max(13), height_m: z.number() });
+const BUILDING_RADIUS_M = 1000;
+/** Every point of a ring must lie this close to the centre; a stray vertex is bad data. */
+const BUILDING_POINT_M = 1200;
+/** No real building outline spans more than this between two points. */
+const BUILDING_SPAN_M = 400;
+const MAX_BUILDINGS = 80;
+
+/**
+ * Validates the map from Loops. Bad building entries are dropped, never the map.
+ * `buildings` is left out (not empty) when none survive, so an old daemon gives the old message.
+ */
+export function parseLoopsMap(raw: unknown): { map: LoopsMap; complete: boolean } | null {
+  const parsed = LoopsMapSchema.safeParse(raw);
+  if (!parsed.success) return null;
+  const { center, roads, water, green, buildings, complete } = parsed.data;
+  const near = (buildings ?? []).flatMap((entry) => {
+    const b = BuildingSchema.safeParse(entry);
+    if (!b.success) return [];
+    const pts = b.data.points.map(([lat, lon]) => ({ lat, lon }));
+    if (pts.some((p) => Math.abs(p.lat) > 90 || Math.abs(p.lon) > 180)) return [];
+    if (pts.some((p) => metresBetween(center, p) > BUILDING_POINT_M)) return [];
+    if (pts.some((p, i) => pts.slice(i + 1).some((q) => metresBetween(p, q) > BUILDING_SPAN_M))) return [];
+    const metres = metresBetween(center, pts[0]!);
+    return metres <= BUILDING_RADIUS_M ? [{ metres, ring: b.data.points, height: Math.min(150, Math.max(3, b.data.height_m)) }] : [];
+  });
+  near.sort((a, b) => a.metres - b.metres);
+  const kept = near.slice(0, MAX_BUILDINGS).map(({ ring, height }) => ({ ring, height }));
+  return { map: { center, roads, water, green, ...(kept.length ? { buildings: kept } : {}) }, complete: complete ?? true };
+}
 
 const nameOf = (v: unknown): string | null =>
   typeof v === "string" ? v : v && typeof v === "object" && "name" in v && typeof v.name === "string" ? v.name : null;
@@ -186,6 +221,8 @@ export function toOsint(raw: LoopsRaw, now: number, report = { dropped: 0 }): Os
   const liveVehicles = valid(VehicleSchema, field(raw.live, "vehicles"), report);
   if (!liveAircraft || !liveVehicles) missing.push("live");
   const trails = new Map((liveAircraft ?? []).map((a) => [a.id, a.trail ?? []]));
+  const vrates = new Map<string, number | null>();
+  for (const a of [...(liveAircraft ?? []), ...(local ?? [])]) if (a.vertical_fpm !== undefined) vrates.set(a.id, a.vertical_fpm);
   const byId = new Map<string, z.infer<typeof AircraftSchema>>();
   for (const a of [...(liveAircraft ?? []), ...(local ?? [])]) byId.set(a.id, a);
   const aircraft = [...byId.values()]
@@ -201,6 +238,7 @@ export function toOsint(raw: LoopsRaw, now: number, report = { dropped: 0 }): Os
       track: a.track ?? null,
       speed_kt: a.speed_kt ?? null,
       emergency: a.emergency ?? false,
+      ...(vrates.has(a.id) ? { vrate: vrates.get(a.id) } : {}),
       trail: (a.trail ?? trails.get(a.id) ?? []).slice(-20),
     }));
 
@@ -324,10 +362,10 @@ export class LoopsFeed {
       const loc = LocationSchema.safeParse(location);
       const fix = loc.success ? (loc.data.fix ?? null) : null;
       if (mapDue(this.map, fix, Date.now() - this.mapAt, this.mapComplete)) {
-        const map = LoopsMapSchema.safeParse(await get(`/v1/map/local?radius_m=${MAP_RADIUS_M}`));
-        if (map.success) {
-          this.map = { center: map.data.center, roads: map.data.roads, water: map.data.water, green: map.data.green };
-          this.mapComplete = map.data.complete ?? true;
+        const map = parseLoopsMap(await get(`/v1/map/local?radius_m=${MAP_RADIUS_M}`));
+        if (map) {
+          this.map = map.map;
+          this.mapComplete = map.complete;
           this.mapAt = Date.now();
           this.onMap(this.map);
         }

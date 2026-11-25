@@ -8,14 +8,19 @@ export type Subject = {
   kind: "person" | "topic";
   name: string;
   note: VaultNote | null;
+  /** How many meeting notes name this subject (`meetings` keeps only the newest 3). */
+  met?: number;
   /** Newest first, at most 3. */
   meetings: { note: VaultNote; firstNameOnly: boolean }[];
   /** Newest first, at most 5. */
   tasks: { text: string; from: string; date: number | null }[];
 };
 export type NameEntry = { id: string | null; rank: number; rule: "any" | "cap" | "capMid" };
-export type RecallIndex = { subjects: Map<string, Subject>; names: Map<string, NameEntry>; notes: number };
-export type Cue = { name: string; facts: string[] };
+/** `notes`: all notes read. `quotable`: those recall may quote (not the wearer's own). */
+export type RecallIndex = { subjects: Map<string, Subject>; names: Map<string, NameEntry>; notes: number; quotable: number };
+/** The lens card of a person; a part the vault has nothing for is left out. */
+export type Card = { lead?: string; met?: number; seen?: string; last?: string; open?: string };
+export type Cue = { name: string; facts: string[]; card?: Card };
 export type RecallContext = { text: string; paths: string[] };
 export const NO_RECALL: RecallContext = { text: "", paths: [] };
 
@@ -60,8 +65,8 @@ const isoDay = (ms: number) => {
   const d = new Date(ms);
   return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate());
 };
-const stripStamp = (title: string) => title.replace(/^\d{4}-\d{2}-\d{2}(?: \d{2}-\d{2})?\s+/, "") || title;
-const when = (note: VaultNote) => note.date ?? note.mtimeMs;
+export const stripStamp = (title: string) => title.replace(/^\d{4}-\d{2}-\d{2}(?: \d{2}-\d{2})?\s+/, "") || title;
+export const when = (note: VaultNote) => note.date ?? note.mtimeMs;
 
 /** The subjects, their names and what each one links to. Pure; rebuilt after every vault change. */
 export function buildIndex(notes: Iterable<VaultNote>, blocked: Iterable<BlockedNote>, self: string[]): RecallIndex {
@@ -107,9 +112,12 @@ export function buildIndex(notes: Iterable<VaultNote>, blocked: Iterable<Blocked
     const own = [note.title, ...note.aliases].map(fold).filter(Boolean);
     if (own.some((key) => wearer.has(key))) for (const key of own) selfNames.add(key);
   }
+  /** The wearer's own notes: nothing of them is attached to a subject. */
+  const ownPaths = new Set<string>();
   for (const note of all) {
     if (note.kind !== "person" && note.kind !== "note") continue;
     const key = fold(note.title);
+    if (key && selfNames.has(key)) ownPaths.add(note.path);
     if (!key || selfNames.has(key)) continue;
     if (note.kind === "note" && key.split(" ").length < 2 && note.aliases.length === 0) continue;
     const id = "n:" + note.path;
@@ -127,6 +135,7 @@ export function buildIndex(notes: Iterable<VaultNote>, blocked: Iterable<Blocked
       const subject = subjects.get(id);
       if (!subject || attached.has(id)) return;
       attached.add(id);
+      subject.met = (subject.met ?? 0) + 1;
       if (subject.meetings.length < MAX_MEETINGS) subject.meetings.push({ note: meeting, firstNameOnly });
     };
     for (const person of meeting.people) {
@@ -149,9 +158,9 @@ export function buildIndex(notes: Iterable<VaultNote>, blocked: Iterable<Blocked
     }
   }
 
-  const index: RecallIndex = { subjects, names, notes: all.length };
+  const index: RecallIndex = { subjects, names, notes: all.length, quotable: all.length - ownPaths.size };
   for (const note of all) {
-    if (note.kind === "meeting" || note.tasks.length === 0) continue;
+    if (note.kind === "meeting" || note.tasks.length === 0 || ownPaths.has(note.path)) continue;
     const own = subjects.has("n:" + note.path) ? "n:" + note.path : null;
     for (const text of note.tasks) {
       const ids = new Set(findSubjects(index, text, false));
@@ -215,33 +224,65 @@ export function findSubjects(index: RecallIndex, text: string, typed = false): s
   return out;
 }
 
+/** True when the text contains the name or an alias of a note that is blocked (`recall: false`). Ignores the capital rules: a leak check, so it errs on the side of yes. */
+export function namesBlocked(index: RecallIndex, text: string): boolean {
+  const tokens = tokenize(text);
+  for (let i = 0; i < tokens.length; i++) {
+    let key = "";
+    for (let len = 1; len <= Math.min(MAX_NAME_WORDS, tokens.length - i); len++) {
+      key += (len > 1 ? " " : "") + (tokens[i + len - 1]?.key ?? "");
+      if (index.names.get(key)?.rank === RANK_BLOCKED) return true;
+    }
+  }
+  return false;
+}
+
 /** Printable ASCII, Latin letters and a few typographic marks: what the lens font can draw. */
-function sanitize(text: string): string {
+export function sanitize(text: string): string {
   return text.replace(/[^\x20-\x7E\p{Script=Latin}·…“”‘’]/gu, "").trim();
 }
 
-function clamp(text: string, max: number): string {
+export function clamp(text: string, max: number): string {
   return text.length <= max ? text : text.slice(0, max - 1).trimEnd() + "…";
 }
 
-/** The two-line lens cue for a person: newest meeting, first open task, first sentence of the note. */
-export function cueFor(subject: Subject, now: Date): Cue | null {
+const shortDate = (ms: number, now: Date) => {
+  const d = new Date(ms);
+  return d.getDate() + " " + MONTHS[d.getMonth()] + (d.getFullYear() !== now.getFullYear() ? " " + d.getFullYear() : "");
+};
+
+/** The two-line lens cue for a person, and the card of the same facts: newest meeting, first open task, first sentence of the note. */
+export function cueFor(subject: Subject, now: Date, index?: RecallIndex): Cue | null {
   if (subject.kind !== "person") return null;
-  const facts: string[] = [];
   const meeting = subject.meetings[0]?.note;
-  if (meeting) {
-    const d = new Date(when(meeting));
-    const year = d.getFullYear() !== now.getFullYear() ? " " + d.getFullYear() : "";
-    facts.push(d.getDate() + " " + MONTHS[d.getMonth()] + year + "  ·  " + stripStamp(meeting.title));
-  }
+  const date = meeting ? shortDate(when(meeting), now) : null;
+  const last = meeting && date ? date + "  ·  " + stripStamp(meeting.title) : null;
   const task = subject.meetings.flatMap((m) => m.note.tasks)[0] ?? subject.tasks[0]?.text;
-  if (task) facts.push("Open: " + task.replace(/^Me:\s+/, ""));
+  const open = task ? task.replace(/^Me:\s+/, "") : null;
   const lead = subject.note?.lead;
-  if (lead) facts.push(/^.*?[.!?](?=\s|$)/.exec(lead)?.[0] ?? lead);
+  const sentence = lead ? (/^.*?[.!?](?=\s|$)/.exec(lead)?.[0] ?? lead) : null;
+  // A part (a meeting title, a task, a lead) that names a blocked note is left out.
+  const clean = (text: string | null, max: number): string | null => {
+    if (!text || (index && namesBlocked(index, text))) return null;
+    return clamp(sanitize(text), max) || null;
+  };
   const name = clamp(sanitize(subject.name), NAME_CHARS);
-  const clean = facts.map((fact) => clamp(sanitize(fact), FACT_CHARS)).filter(Boolean).slice(0, 3);
-  if (!name || clean.length === 0) return null;
-  return { name, facts: clean };
+  const facts = [clean(last, FACT_CHARS), open && clean("Open: " + open, FACT_CHARS), clean(sentence, FACT_CHARS)]
+    .filter((fact): fact is string => fact !== null)
+    .slice(0, 3);
+  if (index && namesBlocked(index, name)) return null;
+  if (!name || facts.length === 0) return null;
+  const met = subject.met ?? subject.meetings.length;
+  const card: Card = {};
+  const cardLead = clean(sentence, 80);
+  if (cardLead) card.lead = cardLead;
+  if (met > 0) card.met = met;
+  if (date) card.seen = clamp(date, 12);
+  const cardLast = clean(last, 60);
+  if (cardLast) card.last = cardLast;
+  const cardOpen = clean(open, 60);
+  if (cardOpen) card.open = cardOpen;
+  return Object.keys(card).length > 0 ? { name, facts, card } : { name, facts };
 }
 
 const wordsOf = (text: string) => new Set(fold(text).split(" "));
@@ -409,7 +450,7 @@ export class RecallTracker {
       for (const id of ids) {
         const subject = index.subjects.get(id);
         if (!subject || subject.kind !== "person" || this.cued.has(id)) continue;
-        const cue = cueFor(subject, new Date(now));
+        const cue = cueFor(subject, new Date(now), index);
         if (!cue) continue;
         this.sent.set(cue.name, id);
         this.lastCueAt = now;
@@ -454,6 +495,11 @@ export class RecallTracker {
       this.fail(error);
       return NO_RECALL;
     }
+  }
+
+  /** The subject id of the person whose cue carried this name, or undefined. */
+  subjectOf(name: string): string | undefined {
+    return this.sent.get(name);
   }
 
   /** The lens showed the cue for this name: that person is not cued again in this conversation. */

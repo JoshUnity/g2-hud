@@ -2,6 +2,9 @@ import { ImageRawDataUpdate, ImageRawDataUpdateResult, type EvenAppBridge } from
 import type { Box } from "./box";
 import { sameFrame } from "./pixels";
 
+/** A send that has not settled after this long counts as failed. */
+export const SEND_TIMEOUT_MS = 5000;
+
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export type Producer = {
@@ -28,6 +31,9 @@ export class ImagePipe {
   /** The current loop; a new run() waits for it, so two loops never send at once. */
   private loop: Promise<void> = Promise.resolve();
   private readonly started = performance.now();
+  /** Sends that have not settled yet (a send past the timeout may still be in flight). */
+  private inFlight = 0;
+  private idle: (() => void)[] = [];
 
   constructor(private bridge: EvenAppBridge) {}
 
@@ -44,6 +50,37 @@ export class ImagePipe {
       if (name && slot.box.name !== name) continue;
       slot.invalidate?.();
       slot.due = Math.min(slot.due, now);
+    }
+  }
+
+  /** Resolves when no image send is in flight: wait for it before a page rebuild, so the two never overlap. */
+  settled(): Promise<void> {
+    return this.inFlight === 0 ? Promise.resolve() : new Promise((resolve) => this.idle.push(resolve));
+  }
+
+  /**
+   * One send. A rejection or a send that outlasts SEND_TIMEOUT_MS counts as failed. Trade-off: after a timeout
+   * the hung send may still be in flight when the next one starts, so the "one send at a time" rule is broken
+   * once, on purpose: a host that never answers must not freeze the pictures for good. `settled()` still waits
+   * for the hung send to end.
+   */
+  private async send(box: Box, frame: Uint8Array): Promise<boolean> {
+    this.inFlight++;
+    const call = Promise.resolve()
+      .then(() => this.bridge.updateImageRawData(new ImageRawDataUpdate({ containerID: box.id, containerName: box.name, imageData: frame })))
+      .finally(() => {
+        if (--this.inFlight === 0) for (const wake of this.idle.splice(0)) wake();
+      });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), SEND_TIMEOUT_MS);
+    });
+    try {
+      return (await Promise.race([call, late])) === ImageRawDataUpdateResult.success;
+    } catch {
+      return false;
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -72,15 +109,18 @@ export class ImagePipe {
         await sleep(slot ? Math.min(250, Math.max(20, slot.due - now)) : 250);
         continue;
       }
-      const fps = slot.fps();
-      slot.due = now + (fps > 0 ? 1000 / fps : 2000);
-      const frame = slot.render((now - this.started) / 1000);
+      let frame: Uint8Array;
+      try {
+        const fps = slot.fps();
+        slot.due = now + (fps > 0 ? 1000 / fps : 2000);
+        frame = slot.render((now - this.started) / 1000);
+      } catch {
+        // A producer that throws counts as a failed send: the others keep going.
+        if (++failures > 5) await sleep(2000);
+        continue;
+      }
       if (slot.last && sameFrame(frame, slot.last)) continue;
-      const box = slot.box;
-      const result = await this.bridge.updateImageRawData(
-        new ImageRawDataUpdate({ containerID: box.id, containerName: box.name, imageData: frame }),
-      );
-      if (result === ImageRawDataUpdateResult.success) {
+      if (await this.send(slot.box, frame)) {
         slot.last = frame;
         failures = 0;
       } else if (++failures > 5) {

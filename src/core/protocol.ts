@@ -22,6 +22,8 @@ export const OsintSchema = z.object({
   connected: z.boolean(),
   error: z.string().nullable(),
   at: z.number(),
+  /** Where the aircraft data comes from, when it is not the owner's own receiver: "adsb.fi", "opensky", "airplanes.live". */
+  aircraftSource: z.string().min(1).max(24).optional(),
   me: z
     .object({
       lat: z.number(),
@@ -50,6 +52,8 @@ export const OsintSchema = z.object({
       lat: z.number(),
       lon: z.number(),
       altitude_ft: z.number().nullable(),
+      /** Climb rate in feet per minute, positive = climbing. */
+      vrate: z.number().nullable().optional(),
       track: z.number().nullable(),
       speed_kt: z.number().nullable(),
       emergency: z.boolean(),
@@ -67,6 +71,8 @@ export const MapSchema = z.object({
   roads: z.array(z.object({ class: z.string(), points: z.array(LatLon) })),
   water: z.array(z.array(LatLon)),
   green: z.array(z.array(LatLon)),
+  /** Outlines for the 3D city: closed rings (last point repeats the first) with a height in metres. Absent when Loops sends none. */
+  buildings: z.array(z.object({ ring: z.array(LatLon).min(4).max(13), height: z.number().min(3).max(150) })).max(80).optional(),
 });
 export type LocalMap = z.infer<typeof MapSchema>;
 
@@ -77,11 +83,32 @@ export const CodeViewSchema = z.object({
   prompt: z.string(),
   log: z.array(z.string()),
   /** A tool call waiting on the glasses: `summary` is one short line (log, tab menu); `text` is the whole call, to show in full before a tap allows it. */
-  approval: z.object({ id: z.number().int(), summary: z.string(), text: z.string() }).nullable(),
+  approval: z
+    .object({
+      id: z.number().int(),
+      summary: z.string(),
+      text: z.string(),
+      /** The tool asking, such as "Bash". */
+      tool: z.string().max(24).optional(),
+      /** The folder it runs in. */
+      cwd: z.string().max(80).optional(),
+      /** The call needs the network. */
+      network: z.boolean().optional(),
+    })
+    .nullable(),
   result: z.string(),
   stats: z.string(),
   error: z.string(),
   startedAt: z.number().nullable(),
+  /** The files this task touched, oldest first. */
+  files: z.array(z.object({ path: z.string().min(1).max(120), state: z.enum(["read", "edit"]) })).max(24).optional(),
+  /** The file being touched now. */
+  current: z.string().max(120).nullable().optional(),
+  /** Top-level folders of the project, with a file count each. */
+  tree: z.array(z.object({ name: z.string().min(1).max(40), files: z.number().int().min(0) })).max(12).optional(),
+  /** Lines added and removed by this task. */
+  added: z.number().int().min(0).optional(),
+  removed: z.number().int().min(0).optional(),
 });
 export type CodeView = z.infer<typeof CodeViewSchema>;
 
@@ -106,6 +133,8 @@ export const HackViewSchema = z.object({
   startedAt: z.number().nullable(),
   /** Finished turns, oldest first, for the terminal's scrollback. */
   history: z.array(z.object({ prompt: z.string(), answer: z.string() })),
+  /** Recent tokens per second while an answer streams, oldest first. */
+  rate: z.array(z.number().min(0)).max(22).optional(),
 });
 export type HackView = z.infer<typeof HackViewSchema>;
 
@@ -120,12 +149,37 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("thinking"), id: z.number().int() }),
   /** It was not a question; nothing will be shown. */
   z.object({ type: z.literal("answer_none"), id: z.number().int() }),
-  z.object({ type: z.literal("answer_start"), id: z.number().int(), question: z.string() }),
+  /** `notes`: titles of the vault notes sent with this request. */
+  z.object({ type: z.literal("answer_start"), id: z.number().int(), question: z.string(), notes: z.array(z.string().min(1).max(40)).max(6).optional() }),
   z.object({ type: z.literal("answer_delta"), id: z.number().int(), text: z.string() }),
   z.object({ type: z.literal("answer_done"), id: z.number().int() }),
   z.object({ type: z.literal("error"), message: z.string() }),
   /** Answers vault recall: a known person was named. Made on the Mac; the phone page logs only the name. */
-  z.object({ type: z.literal("recall"), name: z.string().min(1).max(60), facts: z.array(z.string().max(80)).min(1).max(3) }),
+  z.object({
+    type: z.literal("recall"),
+    name: z.string().min(1).max(60),
+    facts: z.array(z.string().max(80)).min(1).max(3),
+    /** The node of that person in the last `vault_graph`. */
+    id: z.number().int().min(0).optional(),
+    /** The lens card of this person. Every part is optional: a missing one is left off the card. */
+    card: z
+      .object({
+        lead: z.string().max(80).optional(),
+        met: z.number().int().min(0).optional(),
+        seen: z.string().max(12).optional(),
+        last: z.string().max(60).optional(),
+        open: z.string().max(60).optional(),
+      })
+      .optional(),
+  }),
+  /** The Answers vault as a graph. Titles only, from notes the server may already quote. */
+  z.object({
+    type: z.literal("vault_graph"),
+    nodes: z.array(z.object({ id: z.number().int().min(0), title: z.string().min(1).max(40), kind: z.enum(["person", "topic", "meeting"]) })).max(80),
+    links: z.array(z.tuple([z.number().int(), z.number().int()])).max(240),
+    /** How many notes and people the whole vault holds (the graph shows only some). */
+    total: z.object({ notes: z.number().int().min(0), people: z.number().int().min(0) }).optional(),
+  }),
 ]);
 export type ServerMessage = z.infer<typeof ServerMessageSchema>;
 
@@ -158,6 +212,8 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("hack_stop") }),
   /** HackOS: forget the conversation and start fresh. */
   z.object({ type: z.literal("hack_new") }),
+  /** Where the phone is, for Around and Sky when the server fetches the open data itself. */
+  z.object({ type: z.literal("position"), lat: z.number().min(-90).max(90), lon: z.number().min(-180).max(180), accuracy: z.number().nonnegative().optional() }),
   /** Answers vault recall: the cue for this name was on the lens for 3 s. */
   z.object({ type: z.literal("recall_shown"), name: z.string().min(1).max(60) }),
 ]);
