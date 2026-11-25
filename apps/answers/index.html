@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Answers</title>
+    <style>
+      body { font: 15px/1.4 -apple-system, system-ui, sans-serif; margin: 16px; background: #0b0f0c; color: #d8f5dc; }
+      h1 { font-size: 18px; margin: 0 0 8px; }
+      #status { color: #7fd88f; margin-bottom: 12px; }
+      #log { white-space: pre-wrap; border-top: 1px solid #234; padding-top: 8px; max-height: 60vh; overflow-y: auto; }
+      .them { color: #fff; } .me { color: #8aa; } .answer { color: #7fd88f; } .recall { color: #8fb; }
+      form { display: flex; gap: 8px; margin-top: 12px; }
+      input { flex: 1; padding: 8px; background: #111; color: inherit; border: 1px solid #345; border-radius: 6px; }
+      button { padding: 8px 12px; border-radius: 6px; border: 0; background: #2d6a3a; color: #fff; }
+    </style>
+  </head>
+  <body>
+    <h1>Answers</h1>
+    <div id="status">Starting…</div>
+    <div id="log"></div>
+    <form id="ask">
+      <input id="question" placeholder="Type a question to test" autocomplete="off" />
+      <button type="submit">Ask</button>
+      <button type="button" id="end">Save meeting</button>
+    </form>
+    <script type="module" src="../../src/answers/main.ts"></script>
+  </body>
+</html>

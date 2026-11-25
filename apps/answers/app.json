@@ -1,0 +1,25 @@
+{
+  "package_id": "dev.local.g2hud.answers",
+  "edition": "202601",
+  "name": "Answers",
+  "version": "0.1.0",
+  "min_app_version": "2.2.10",
+  "min_sdk_version": "0.0.16",
+  "entrypoint": "index.html",
+  "permissions": [
+    {
+      "name": "g2-microphone",
+      "desc": "Listens to the conversation so the app can show you an answer when someone asks you a question."
+    },
+    {
+      "name": "network",
+      "desc": "Sends conversation audio to the answer server on your own computer, which transcribes it and drafts answers.",
+      "whitelist": [
+        "http://192.0.2.1:5173"
+      ]
+    }
+  ],
+  "supported_languages": [
+    "en"
+  ]
+}

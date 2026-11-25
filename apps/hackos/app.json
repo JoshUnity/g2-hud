@@ -1,0 +1,25 @@
+{
+  "package_id": "dev.local.g2hud.hackos",
+  "edition": "202601",
+  "name": "HackOS",
+  "version": "0.1.0",
+  "min_app_version": "2.2.10",
+  "min_sdk_version": "0.0.16",
+  "entrypoint": "index.html",
+  "permissions": [
+    {
+      "name": "g2-microphone",
+      "desc": "Records your spoken message while you hold the touchpad, and only then."
+    },
+    {
+      "name": "network",
+      "desc": "Sends your messages to the HUD server on your own computer, which passes them to your own model server.",
+      "whitelist": [
+        "http://192.0.2.1:5173"
+      ]
+    }
+  ],
+  "supported_languages": [
+    "en"
+  ]
+}

@@ -1,0 +1,47 @@
+import { MenuContainerProperty, MenuItemProperty, RebuildPageContainer, StartUpPageCreateResult, TextContainerProperty, type EvenAppBridge } from "@evenrealities/even_hub_sdk";
+import { describe, expect, it } from "vitest";
+import { openPage, type PageSpec } from "../src/core/page";
+
+function fakeBridge(created: StartUpPageCreateResult, rebuilt: boolean) {
+  const calls: string[] = [];
+  let rebuildArg: RebuildPageContainer | null = null;
+  const bridge = {
+    createStartUpPageContainer: async () => {
+      calls.push("create");
+      return created;
+    },
+    rebuildPageContainer: async (c: RebuildPageContainer) => {
+      calls.push("rebuild");
+      rebuildArg = c;
+      return rebuilt;
+    },
+  } as unknown as EvenAppBridge;
+  return { bridge, calls, rebuildArg: () => rebuildArg };
+}
+
+const spec: PageSpec = {
+  containerTotalNum: 1,
+  textObject: [new TextContainerProperty({ containerID: 1, containerName: "card", content: "hi", isEventCapture: 1 })],
+  menuObject: new MenuContainerProperty({ menuItems: [new MenuItemProperty({ itemID: 1, itemName: "1  tab" })] }),
+};
+
+describe("openPage", () => {
+  it("creates the start-up page and does not rebuild when create succeeds", async () => {
+    const f = fakeBridge(StartUpPageCreateResult.success, false);
+    expect(await openPage(f.bridge, spec)).toBe(true);
+    expect(f.calls).toEqual(["create"]);
+  });
+
+  it("falls back to a rebuild with the same containers when create is refused (page reload)", async () => {
+    const f = fakeBridge(StartUpPageCreateResult.invalid, true);
+    expect(await openPage(f.bridge, spec)).toBe(true);
+    expect(f.calls).toEqual(["create", "rebuild"]);
+    expect(f.rebuildArg()?.textObject?.[0]?.containerName).toBe("card");
+    expect(f.rebuildArg()?.menuObject?.menuItems?.[0]?.itemName).toBe("1  tab");
+  });
+
+  it("reports false when both create and rebuild fail", async () => {
+    const f = fakeBridge(StartUpPageCreateResult.invalid, false);
+    expect(await openPage(f.bridge, spec)).toBe(false);
+  });
+});

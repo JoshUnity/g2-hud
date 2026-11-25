@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>HackOS</title>
+    <style>
+      :root { color-scheme: dark; --glow: #5dfc8a; --dim: #2f8f4d; --faint: #1c5a31; --bg: #030805; }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; }
+      body { margin: 0; display: flex; flex-direction: column; background: var(--bg); color: var(--glow); font: 15px/1.5 ui-monospace, "SF Mono", Menlo, monospace; }
+      header { display: flex; gap: 16px; align-items: baseline; padding: 12px 20px; border-bottom: 1px solid var(--faint); }
+      h1 { margin: 0; font-size: 15px; letter-spacing: 0.24em; font-weight: 600; }
+      #status { color: var(--dim); font-size: 13px; }
+      #term { flex: 1; min-height: 0; overflow-y: auto; padding: 16px 20px; white-space: pre-wrap; overflow-wrap: anywhere; }
+      #term > div { margin-bottom: 10px; max-width: 80ch; }
+      .you { color: var(--dim); }
+      .you::before { content: "> "; }
+      .model.live::after { content: " │"; }
+      .hint { color: var(--faint); }
+      .err { color: #ffb454; }
+      form { display: flex; gap: 8px; padding: 12px 20px 16px; border-top: 1px solid var(--faint); }
+      input { flex: 1; min-width: 0; padding: 10px 12px; background: transparent; color: inherit; font: inherit; border: 1px solid var(--faint); border-radius: 6px; }
+      input::placeholder { color: var(--faint); }
+      button { padding: 10px 14px; background: transparent; color: var(--dim); font: inherit; border: 1px solid var(--faint); border-radius: 6px; cursor: pointer; touch-action: none; user-select: none; }
+      button:hover { color: var(--glow); border-color: var(--dim); }
+      :is(input, button):focus-visible { outline: 2px solid var(--glow); outline-offset: 2px; }
+      #talk.on { background: var(--glow); border-color: var(--glow); color: var(--bg); }
+      @media (max-width: 560px) { form { flex-wrap: wrap; } input { flex-basis: 100%; } button { flex: 1; } }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>HACKOS</h1>
+      <div id="status" role="status">connecting…</div>
+    </header>
+    <div id="term" aria-live="polite"></div>
+    <form id="ask">
+      <input id="prompt" aria-label="Message" placeholder="Type a message, or hold Space to talk" autocomplete="off" autofocus />
+      <button type="submit">Send</button>
+      <button type="button" id="talk">Hold to talk</button>
+      <button type="button" id="stop">Stop</button>
+      <button type="button" id="new">New chat</button>
+    </form>
+    <script type="module" src="../../src/hackos/main.ts"></script>
+  </body>
+</html>

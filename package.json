@@ -1,0 +1,50 @@
+{
+  "name": "g2-hud",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Five Even Hub apps for Even Realities G2 glasses (Answers, Around, Sky, Code, HackOS) and the Mac server behind them",
+  "scripts": {
+    "setup:stt": "brew install whisper-cpp && mkdir -p models && curl -L --fail -o models/ggml-small.en.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin",
+    "dev": "concurrently -k -n stt,server,web -c yellow,cyan,magenta \"npm:dev:stt\" \"npm:dev:server\" \"npm:dev:web\"",
+    "dev:stt": "whisper-server -m models/ggml-small.en.bin --host 127.0.0.1 --port 8178 -nt",
+    "dev:server": "tsx watch --env-file-if-exists=.env server/index.ts",
+    "dev:web": "vite --host",
+    "sim": "node --env-file-if-exists=.env scripts/open.mjs sim answers",
+    "sim:around": "node --env-file-if-exists=.env scripts/open.mjs sim around",
+    "sim:sky": "node --env-file-if-exists=.env scripts/open.mjs sim sky",
+    "sim:code": "node --env-file-if-exists=.env scripts/open.mjs sim code",
+    "sim:hackos": "node --env-file-if-exists=.env scripts/open.mjs sim hackos",
+    "qr": "node --env-file-if-exists=.env scripts/open.mjs qr answers",
+    "qr:around": "node --env-file-if-exists=.env scripts/open.mjs qr around",
+    "qr:sky": "node --env-file-if-exists=.env scripts/open.mjs qr sky",
+    "qr:code": "node --env-file-if-exists=.env scripts/open.mjs qr code",
+    "qr:hackos": "node --env-file-if-exists=.env scripts/open.mjs qr hackos",
+    "url:hackos": "node --env-file-if-exists=.env scripts/open.mjs url hackos",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "build": "tsc --noEmit && APP=answers vite build && APP=around vite build && APP=sky vite build && APP=code vite build && APP=hackos vite build",
+    "pack": "npm run build && node --env-file-if-exists=.env scripts/pack.mjs"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.330",
+    "@anthropic-ai/sdk": "^1.12.0",
+    "@evenrealities/even_hub_sdk": "^0.0.16",
+    "ws": "^8.23.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@evenrealities/evenhub-cli": "^0.2.0",
+    "@evenrealities/evenhub-simulator": "^0.9.5",
+    "@types/node": "^26.6.6",
+    "@types/ws": "^8.18.2",
+    "concurrently": "^10.0.7",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.8",
+    "vitest": "^5.1.1"
+  }
+}
