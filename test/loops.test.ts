@@ -6,7 +6,7 @@ import { createServer as createNetServer, type Server as NetServer } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { LoopsFeed, getJson, isRunning, mapDue, toOsint } from "../server/loops";
+import { LoopsFeed, getJson, isRunning, mapDue, parseLoopsMap, toOsint } from "../server/loops";
 import { metresBetween } from "../src/core/geo";
 import type { Osint } from "../src/core/protocol";
 
@@ -190,5 +190,93 @@ describe("LoopsFeed poll", () => {
     };
     await f.tick();
     expect(updates[0]).toMatchObject({ connected: false, error: "no route", at: 5, me: old.me, items: [], aircraft: [], vehicles: [] });
+  });
+});
+
+describe("parseLoopsMap buildings", () => {
+  const base = { center: { lat: ME.lat, lon: ME.lon, source: "gps" }, roads: [{ class: "primary", points: [[ME.lat, ME.lon], [ME.lat + 0.001, ME.lon]] }], water: [], green: [] };
+  /** A closed square `km` north of ME. */
+  const building = (km: number, height_m = 10) => {
+    const { lat, lon } = north(km);
+    const d = 0.0001;
+    return { points: [[lat, lon], [lat + d, lon], [lat + d, lon + d], [lat, lon + d], [lat, lon]], height_m };
+  };
+
+  it("leaves the buildings key out when Loops sends none", () => {
+    const result = parseLoopsMap(base);
+    expect(result).not.toBeNull();
+    expect("buildings" in result!.map).toBe(false);
+    expect(result!.map.roads).toHaveLength(1);
+    expect("buildings" in parseLoopsMap({ ...base, buildings: [] })!.map).toBe(false);
+  });
+
+  it("trims to 1000 m and 80, nearest first, and renames the fields", () => {
+    const many = Array.from({ length: 120 }, (_, i) => building(0.005 + i * 0.0001));
+    const far = building(1.5);
+    const map = parseLoopsMap({ ...base, buildings: [far, ...many.reverse()] })!.map;
+    expect(map.buildings).toHaveLength(80);
+    const firsts = map.buildings!.map((b) => metresBetween(ME, { lat: b.ring[0]![0], lon: b.ring[0]![1] }));
+    expect(firsts).toEqual([...firsts].sort((a, b) => a - b));
+    expect(Math.max(...firsts)).toBeLessThanOrEqual(1000);
+    expect(map.buildings![0]).toEqual({ ring: many[many.length - 1]!.points, height: 10 });
+    const onlyFar = parseLoopsMap({ ...base, buildings: [far] })!.map;
+    expect("buildings" in onlyFar).toBe(false);
+  });
+
+  it("keeps the roads when a building is malformed", () => {
+    const map = parseLoopsMap({ ...base, buildings: [{ points: "nope", height_m: 5 }, { points: [[1, 2]], height_m: 5 }, building(0.1)] })!.map;
+    expect(map.roads).toHaveLength(1);
+    expect(map.buildings).toHaveLength(1);
+    const whole = parseLoopsMap({ ...base, buildings: "garbage" })!.map;
+    expect(whole.roads).toHaveLength(1);
+    expect("buildings" in whole).toBe(false);
+  });
+
+  it("clamps heights to 3..150", () => {
+    const map = parseLoopsMap({ ...base, buildings: [building(0.1, 1), building(0.2, 400)] })!.map;
+    expect(map.buildings!.map((b) => b.height)).toEqual([3, 150]);
+  });
+
+  it("drops a building with any point over 1200 m away", () => {
+    const b = building(0.1);
+    const stray = { ...b, points: [b.points[0], [0, 0], ...b.points.slice(2)] };
+    const map = parseLoopsMap({ ...base, buildings: [stray, building(0.2)] })!.map;
+    expect(map.roads).toHaveLength(1);
+    expect(map.buildings).toHaveLength(1);
+    expect(parseLoopsMap({ ...base, buildings: [stray] })!.map.buildings).toBeUndefined();
+  });
+
+  it("drops a building whose ring spans more than 400 m", () => {
+    const b = building(0.1);
+    const far = north(0.1 + 0.5);
+    const wide = { ...b, points: [b.points[0], [far.lat, far.lon], ...b.points.slice(2)] };
+    const map = parseLoopsMap({ ...base, buildings: [wide, building(0.2)] })!.map;
+    expect(map.buildings).toHaveLength(1);
+  });
+
+  it("drops a building with a latitude or longitude out of range", () => {
+    const b = building(0.1);
+    const bad = (pt: number[]) => ({ ...b, points: [b.points[0], pt, ...b.points.slice(2)] });
+    const map = parseLoopsMap({ ...base, buildings: [bad([95, 0]), bad([0, 200])] })!.map;
+    expect(map.roads).toHaveLength(1);
+    expect(map.buildings).toBeUndefined();
+  });
+});
+
+describe("toOsint vertical rate", () => {
+  const vrates = (aircraft: object[], live: object[] | null = null) =>
+    toOsint({ location, items: [], aircraft: { aircraft }, live: live && { aircraft: live, vehicles: [] }, map: null }, 1).aircraft.map((a) => ("vrate" in a ? a.vrate : "absent"));
+
+  it("passes climbing, descending, null, absent and malformed values", () => {
+    expect(vrates([plane("a", 1, { vertical_fpm: 1800 })])).toEqual([1800]);
+    expect(vrates([plane("a", 1, { vertical_fpm: -900 })])).toEqual([-900]);
+    expect(vrates([plane("a", 1, { vertical_fpm: null })])).toEqual([null]);
+    expect(vrates([plane("a", 1)])).toEqual(["absent"]);
+    expect(vrates([plane("a", 1, { vertical_fpm: "fast" })])).toEqual(["absent"]);
+  });
+
+  it("takes the live value when the receiver gives none, and the receiver's first otherwise", () => {
+    expect(vrates([plane("a", 1)], [plane("a", 1, { vertical_fpm: 500 })])).toEqual([500]);
+    expect(vrates([plane("a", 1, { vertical_fpm: 700 })], [plane("a", 1, { vertical_fpm: 500 })])).toEqual([700]);
   });
 });

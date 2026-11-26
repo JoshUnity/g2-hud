@@ -8,8 +8,18 @@ export type PageSpec = Pick<RebuildPageContainer, "containerTotalNum" | "listObj
  * example), so a refused create falls back to replacing that page. The caller
  * continues either way: after a reload the old page still has the same
  * containers, so input and updates can still work.
+ *
+ * `startedUp` is true when the intro splash already made the start-up page.
+ * Then the app's page replaces it: a rebuild, tried twice, as the host may
+ * still be busy with the last splash frame.
  */
-export async function openPage(bridge: EvenAppBridge, spec: PageSpec): Promise<boolean> {
+export async function openPage(bridge: EvenAppBridge, spec: PageSpec, startedUp = false): Promise<boolean> {
+  if (startedUp) {
+    const rebuild = () => bridge.rebuildPageContainer(new RebuildPageContainer(spec));
+    if (await rebuild()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    return rebuild();
+  }
   const created = await bridge.createStartUpPageContainer(new CreateStartUpPageContainer(spec));
   if (created === StartUpPageCreateResult.success) return true;
   return bridge.rebuildPageContainer(new RebuildPageContainer(spec));

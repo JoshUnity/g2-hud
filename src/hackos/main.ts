@@ -1,23 +1,29 @@
 import {
   AudioInputSource,
   AudioSpeakerRole,
-  ImageContainerProperty,
   OsEventTypeList,
-  TextContainerProperty,
   TextContainerUpgrade,
   waitForEvenAppBridge,
   type EvenAppBridge,
   type EvenHubEvent,
 } from "@evenrealities/even_hub_sdk";
-import { Sigil, voiceLevel } from "../answers/animator";
-import { CARD, CLOCK, LIGHT, QUESTION, SIGIL, STATUS, fitBytes, type Cell } from "../answers/hud";
+import { voiceLevel } from "../core/voice";
+import { LENS_TILES, lensTiles } from "../core/board";
 import type { Box } from "../core/box";
-import { eventTypeOf } from "../core/events";
+import { eventTypeOf, onExit } from "../core/events";
+import { LIGHT, iconProp, textProp, type Cell } from "../core/hud";
 import { ImagePipe } from "../core/imagepipe";
-import { connectServer } from "../core/net";
-import { notePageFailure, openPage } from "../core/page";
+import { connectServer, type Server } from "../core/net";
+import { notePageFailure, openPage, type PageSpec } from "../core/page";
 import { speakerCode, type HackView } from "../core/protocol";
-import { HOLD_DROPPED_NOTE, HOLD_LIMIT_NOTE, MAX_HOLD_MS, doubleTapAction, hackScreen, stoppable } from "./view";
+import { playSplash } from "../core/splash";
+import { clockText, fitBytes } from "../core/text";
+import { demoView } from "./demo";
+import { ICON, ORDER } from "./icon";
+import { BOOT_MS, bootParam, hackFps, renderHack } from "./render";
+import {
+  BODY_BOX, HOLD_DROPPED_NOTE, HOLD_LIMIT_NOTE, MAX_HOLD_MS, TEXT_BOXES, bootScreen, doubleTapAction, hackScreen, stoppable, type HackScreen,
+} from "./view";
 
 /**
  * HackOS: talk to your own model. On the glasses, hold to talk; the answer
@@ -25,14 +31,15 @@ import { HOLD_DROPPED_NOTE, HOLD_LIMIT_NOTE, MAX_HOLD_MS, doubleTapAction, hackS
  * type, or hold Space to talk through the Mac's microphone.
  */
 
-const TEXT_BOXES: Box[] = [STATUS, CLOCK, QUESTION, CARD];
 const BUSY = new Set<HackView["state"]>(["waking", "thinking", "answering"]);
 const GLASSES_MIC_NOTE = "The glasses microphone did not start. Reopen HackOS.";
 /** A bridge call that gives no answer in this time counts as failed, so one lost answer cannot stop the display. */
 const BRIDGE_TIMEOUT_MS = 5000;
 const MAC_MIC_NOTE = "The microphone is not available. Allow it for this page, or type.";
 
-let view: HackView | null = null;
+/** `?demo=<scene>`: a fixed screen with no server, for the glasses page only. */
+const demo = new URLSearchParams(location.search).get("demo");
+let view: HackView | null = demo ? demoView(demo) : null;
 let page = 0;
 let holding = false;
 /** Set only when the glasses page exists; in a plain browser (the Mac terminal) it stays null. */
@@ -48,7 +55,20 @@ let endedAt = 0;
 let talkAttempt = 0;
 /** Ends a hold that lasts MAX_HOLD_MS. */
 let holdTimer: ReturnType<typeof setTimeout> | null = null;
-const sigil = new Sigil(SIGIL);
+/** The lens is one picture: it is drawn from the latest screen. */
+let latest: HackScreen = hackScreen(null, 0, new Date());
+/** The opening (the core boots): when it began, and which state it began in. */
+let bootAt: number | null = null;
+let bootState: HackView["state"] | null = null;
+/** The opening plays once, when the first view arrives after the page opened: this is set then. */
+let bootDecided = false;
+const bootOptions = bootParam(location.search);
+/** A smoothed voice level, 0 to 1, for the recording core and icon. */
+let level = 0;
+let target = 0;
+let pipe: ImagePipe | null = null;
+/** The time at which a still lens turns its core, so a core at rest draws the same frame every time. */
+const REST_T = 2;
 const shown = new Map<string, Cell>();
 
 // ---- Terminal page (the Mac interface; also the phone page) -------------------
@@ -115,32 +135,65 @@ function scheduleRender(): void {
   }, 150);
 }
 
-function cells(): Record<string, Cell> {
-  const s = hackScreen(view, page, new Date(), notice());
-  page = s.page;
-  sigil.setMode(holding ? "listening" : s.sigil);
-  return { [STATUS.name]: s.status, [CLOCK.name]: s.clock, [QUESTION.name]: s.question, [CARD.name]: s.card };
+/** The opening's progress, 0 to 1; 1 when it is not playing. Ends itself when its time is up. */
+function reveal(): number {
+  if (bootAt === null) return 1;
+  if (bootOptions.frozen !== null) return bootOptions.frozen;
+  const r = (Date.now() - bootAt) / BOOT_MS;
+  if (r >= 1) bootAt = null;
+  return Math.min(1, r);
 }
 
-function layout(content: Record<string, Cell>) {
-  const text = (box: Box, extra: Partial<TextContainerProperty> = {}) => {
-    const cell = content[box.name] ?? { content: "", color: LIGHT.secondary };
-    return new TextContainerProperty({
-      xPosition: box.x, yPosition: box.y, width: box.width, height: box.height, containerID: box.id, containerName: box.name,
-      content: fitBytes(cell.content), textColor: cell.color, paddingLength: 0, isEventCapture: 0, ...extra,
-    });
-  };
+/** The screen for now. Also starts and ends the opening. */
+function screen(): HackScreen {
+  let s = hackScreen(view, page, new Date(), notice());
+  page = s.page;
+  // A hold shows at once, before the server's own "recording" arrives.
+  if (holding) s = { ...s, mode: "recording" };
+  // The core boots once, when the first view arrives (after the page opened) and the app is at rest.
+  if (view && pipe && !bootDecided) {
+    bootDecided = true;
+    if (s.mode === "idle" && !bootOptions.off) {
+      bootAt = Date.now();
+      bootState = view.state;
+    }
+  }
+  // Any other state, and any note, ends it at once.
+  if (bootAt !== null && (s.mode !== "idle" || view?.state !== bootState || notice() || view?.error)) bootAt = null;
+  if (bootAt !== null && s.layout === "answer") s = bootScreen(s);
+  latest = s;
+  return s;
+}
+
+const cellsOf = (s: HackScreen): Record<string, Cell> => ({
+  status: s.status, prompt: s.prompt, body: s.body, sentence: s.sentence, hint: s.hint,
+});
+
+/** What the picture shows, apart from time: when it changes the pipe draws again at once. */
+const pictureKey = (s: HackScreen): string => JSON.stringify([s.mode, s.layout, s.footer, s.speed, s.bars, s.seconds, clockText(new Date()), reveal() < 1]);
+let lastKey = "";
+
+/** One lens frame from the latest screen, at pipe time `t`. */
+function lens(t: number): Uint8Array {
+  level += (target - level) * 0.35;
+  target *= 0.8;
+  const r = reveal();
+  const s = latest;
+  const still = !demo && r >= 1 && (s.mode === "idle" || s.mode === "off" || s.mode === "recording");
+  return renderHack(s, { t: still ? REST_T : t, clock: clockText(new Date()), reveal: r, level });
+}
+
+const lensFps = (): number => hackFps(latest, reveal(), !!demo);
+
+/** One fixed page for every state, so nothing is rebuilt (a rebuild flickers). The lens is four image tiles behind, the text in front: every container sets zOrderIndex. */
+function layout(s: HackScreen): PageSpec {
+  const cells = cellsOf(s);
   return {
-    containerTotalNum: 5,
-    imageObject: [
-      new ImageContainerProperty({ xPosition: SIGIL.x, yPosition: SIGIL.y, width: SIGIL.width, height: SIGIL.height, containerID: SIGIL.id, containerName: SIGIL.name }),
-    ],
-    textObject: [
-      text(STATUS),
-      text(CLOCK),
-      text(QUESTION),
-      text(CARD, { borderWidth: 1, borderColor: 5, borderRadius: 8, paddingLength: 8, isEventCapture: 1 }),
-    ],
+    containerTotalNum: LENS_TILES.length + TEXT_BOXES.length,
+    imageObject: LENS_TILES.map((box, i) => Object.assign(iconProp(box), { zOrderIndex: i + 1 })),
+    textObject: TEXT_BOXES.map((box, i) =>
+      textProp(box, cells[box.name] ?? { content: "", color: LIGHT.ambient }, { zOrderIndex: 10 + i, ...(box === BODY_BOX ? { isEventCapture: 1 } : {}) }),
+    ),
   };
 }
 
@@ -156,7 +209,8 @@ function capped(call: Promise<boolean>): Promise<boolean> {
 async function update(box: Box, cell: Cell): Promise<void> {
   const next = { content: fitBytes(cell.content), color: cell.color };
   const prev = shown.get(box.name);
-  if (!bridge || (prev && prev.content === next.content && prev.color === next.color)) return;
+  // After a system exit nothing more goes to the glasses.
+  if (!bridge || stopped || (prev && prev.content === next.content && (next.content === "" || prev.color === next.color))) return;
   shown.set(box.name, next);
   const ok = await capped(
     bridge.textContainerUpgrade(new TextContainerUpgrade({ containerID: box.id, containerName: box.name, content: next.content, textColor: next.color })),
@@ -178,8 +232,13 @@ async function render(): Promise<void> {
   try {
     do {
       renderAgain = false;
-      const next = cells();
-      for (const box of TEXT_BOXES) await update(box, next[box.name] ?? { content: "", color: 1 });
+      const next = cellsOf(screen());
+      const key = pictureKey(latest);
+      if (key !== lastKey) {
+        lastKey = key;
+        pipe?.poke();
+      }
+      for (const box of TEXT_BOXES) await update(box, next[box.name] ?? { content: "", color: LIGHT.ambient });
       // The app was closed during this pass: start no other.
     } while (renderAgain && !stopped);
   } finally {
@@ -187,7 +246,8 @@ async function render(): Promise<void> {
   }
 }
 
-const server = connectServer(
+const none: Server = { send: () => undefined, sendBinary: () => undefined, isOpen: () => false, close: () => undefined };
+const server: Server = demo ? none : connectServer(
   (message) => {
     if (message.type === "error") {
       keyNote = message.message;
@@ -239,7 +299,7 @@ async function micStart(attempt: number): Promise<void> {
     frame[0] = self;
     const data = new DataView(frame.buffer);
     for (let i = 0; i < samples.length; i++) data.setInt16(1 + i * 2, Math.round(Math.max(-1, Math.min(1, samples[i] ?? 0)) * 32767), true);
-    sigil.setLevel(voiceLevel(frame.subarray(1)));
+    hear(voiceLevel(frame.subarray(1)));
     server.sendBinary(frame);
   };
   source.connect(node);
@@ -252,6 +312,11 @@ async function micStart(attempt: number): Promise<void> {
       void context.close();
     },
   };
+}
+
+/** Your voice level, from the glasses microphone or this computer's. */
+function hear(heard: number): void {
+  target = Math.max(target, Math.max(0, Math.min(1, heard)));
 }
 
 // ---- Input -------------------------------------------------------------------
@@ -352,7 +417,7 @@ function onEvent(event: EvenHubEvent): void {
   if (event.audioEvent) {
     if (!holding) return;
     const { audioPcm, speakerRole } = event.audioEvent;
-    sigil.setLevel(voiceLevel(audioPcm));
+    hear(voiceLevel(audioPcm));
     const frame = new Uint8Array(audioPcm.length + 1);
     frame[0] = speakerCode(speakerRole === AudioSpeakerRole.Other ? "other" : speakerRole === AudioSpeakerRole.Self ? "self" : "unknown");
     frame.set(audioPcm, 1);
@@ -393,6 +458,8 @@ function onEvent(event: EvenHubEvent): void {
 
 /** Set by start(): stops what start() began. */
 let stopPage: (() => void) | null = null;
+/** Unsubscribes the early exit listener (see onExit). */
+let offExit: (() => void) | null = null;
 
 /** The host is closing the app. The WebView can outlive this event, so release everything here (as Answers does). */
 function shutdown(): void {
@@ -400,6 +467,8 @@ function shutdown(): void {
   // Sends the discard and closes the microphone before the socket closes.
   dropHold("");
   stopped = true;
+  offExit?.();
+  offExit = null;
   stopPage?.();
   clearInterval(tick);
   if (renderTimer) clearTimeout(renderTimer);
@@ -410,24 +479,38 @@ function shutdown(): void {
 async function start(): Promise<void> {
   // The SDK returns a bridge in any browser, also with no Even app around it.
   const host = await waitForEvenAppBridge();
-  const content = cells();
-  const opened = await openPage(host, layout(content));
+  // Listens from now on, so an exit during the intro or while the page is built is not lost.
+  offExit = onExit(host, shutdown);
+  // The intro owns the lens first. Nothing else sends to the glasses until it returns.
+  const intro = await playSplash(host, { name: "HackOS", icon: ICON, order: ORDER });
+  if (intro.exited || stopped) return shutdown();
+  // After the intro, so data that arrived during it is on the first page.
+  const first = screen();
+  const opened = await openPage(host, layout(first), intro.startedUp);
+  // The host closed the app while the page was being built.
+  if (stopped) return;
   // No page and no Even app (the SDK needs window.flutter_inappwebview): a plain browser, the
   // Mac terminal. `bridge` stays null, so talk() uses this computer's microphone.
   if (!opened && !("flutter_inappwebview" in window)) return;
   // On failure, carry on: after a reload the host still holds the old page. `shown` stays empty, so every cell is sent again.
   if (opened) {
-    for (const [name, cell] of Object.entries(content)) shown.set(name, { content: fitBytes(cell.content), color: cell.color });
+    for (const [name, cell] of Object.entries(cellsOf(first))) shown.set(name, { content: fitBytes(cell.content), color: cell.color });
   } else notePageFailure();
   // Only now: text updates and the glasses microphone need the page.
   bridge = host;
   const unsubscribe = bridge.onEvenHubEvent(onEvent);
-  const pipe = new ImagePipe(bridge);
-  pipe.set([sigil.producer()]);
-  void pipe.run();
+  const images = new ImagePipe(bridge);
+  pipe = images;
+  images.set(lensTiles(lens, lensFps));
+  void images.run();
+  // The first view may be here already.
+  void render();
+  // A demo has no microphone: the recording scene plays a made-up voice.
+  const voice = demo === "recording" ? setInterval(() => hear(0.5 + 0.5 * Math.sin(Date.now() / 450)), 200) : null;
   stopPage = () => {
     unsubscribe();
-    pipe.stop();
+    images.stop();
+    if (voice) clearInterval(voice);
   };
 }
 

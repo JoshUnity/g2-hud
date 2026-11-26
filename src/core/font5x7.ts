@@ -1,4 +1,8 @@
-/** A 5 x 7 pixel font for labels inside images (the glasses font only exists in text containers). */
+/**
+ * A 5 x 7 pixel font for labels inside images (the glasses font only exists in text containers).
+ * Every character the board's FONT table has is the board's bitmap. `?`, the arrows and the space are extra:
+ * the board draws nothing for them.
+ */
 export const GLYPH_W = 5;
 export const GLYPH_H = 7;
 
@@ -46,7 +50,13 @@ export const GLYPHS: Record<string, string[]> = {
   "+": G("00000 00100 00100 11111 00100 00100 00000"),
   ".": G("00000 00000 00000 00000 00000 01100 01100"),
   ":": G("00000 01100 01100 00000 01100 01100 00000"),
-  "/": G("00001 00010 00010 00100 01000 01000 10000"),
+  "/": G("00000 00001 00010 00100 01000 10000 00000"),
+  ",": G("00000 00000 00000 00000 01100 00100 01000"),
+  "·": G("00000 00000 00000 01100 01100 00000 00000"),
+  "°": G("01100 10010 10010 01100 00000 00000 00000"),
+  "!": G("00100 00100 00100 00100 00100 00000 00100"),
+  ">": G("01000 00100 00010 00001 00010 00100 01000"),
+  "\"": G("01010 01010 01010 00000 00000 00000 00000"),
   "?": G("01110 10001 00001 00010 00100 00000 00100"),
   "↑": G("00100 01110 10101 00100 00100 00100 00100"),
   "↓": G("00100 00100 00100 00100 10101 01110 00100"),

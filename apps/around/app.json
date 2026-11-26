@@ -9,10 +9,14 @@
   "permissions": [
     {
       "name": "network",
-      "desc": "Reads your Loops city view through the HUD server on your own computer.",
+      "desc": "Reads open data about your surroundings through the HUD server on your own computer.",
       "whitelist": [
         "http://192.0.2.1:5173"
       ]
+    },
+    {
+      "name": "location",
+      "desc": "Sends your phone's position to the HUD server on your own computer, so it can find what is around you. It goes nowhere else."
     }
   ],
   "supported_languages": [

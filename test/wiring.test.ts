@@ -4,11 +4,12 @@
  * rescans kept off the answer path, and a broken vault that never breaks an answer.
  * No network and no Claude: the socket, Whisper, the summary and streamAnswer are fakes.
  */
-import { cp, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { cp, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AnswerHandlers } from "../server/answer";
+import { nodeTitle } from "../server/graph";
 import { RECALL_CHARS } from "../server/recall";
 import type { Vault } from "../server/vault";
 import type { ServerMessage } from "../src/core/protocol";
@@ -81,7 +82,7 @@ vi.mock("../server/summarize", () => ({
 const streams = h.streams as unknown as FakeStream[];
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 /** Waits for a condition (real timers), at most `ms`. */
-const until = async (done: () => boolean, ms = 3000) => {
+const until = async (done: () => boolean, ms = 15_000) => {
   for (let t = 0; t < ms && !done(); t += 20) await wait(20);
 };
 const FIXTURE = join(import.meta.dirname, "fixtures", "vault");
@@ -125,7 +126,7 @@ class FakeWs {
   }
 }
 
-let Session: new (ws: FakeWs) => unknown;
+let Session: new (ws: FakeWs, app?: string | null) => unknown;
 let vaultDir = "";
 const vault = () => h.vault as Vault;
 /** Saves (Session.endMeeting) started so far, and those still running. */
@@ -168,9 +169,9 @@ afterAll(async () => {
 
 describe("Session vault recall", () => {
   const sockets: FakeWs[] = [];
-  const open = (): FakeWs => {
+  const open = (app: string | null = null): FakeWs => {
     const ws = new FakeWs();
-    new Session(ws);
+    new Session(ws, app);
     sockets.push(ws);
     return ws;
   };
@@ -235,7 +236,8 @@ describe("Session vault recall", () => {
     // So does the end of a meeting.
     ws.text({ type: "recall_shown", name: cue.name });
     ws.text({ type: "end_meeting" });
-    await wait(50);
+    // endMeeting starts the next conversation (recall.reset) before its first await.
+    await until(() => ended >= FakeWs.saves);
     later(25_000);
     ws.text({ type: "ask", text: "Hi Sarah, good to see you." });
     expect(ws.cues()).toHaveLength(4);
@@ -289,7 +291,9 @@ describe("Session vault recall", () => {
     h.transcript = "Did Sarah send over the deck yet?";
     ws.speech(10);
     ws.text({ type: "end_meeting" });
-    for (let i = 0; i < 100 && !ws.sent.some((m) => m.type === "status" && m.text.startsWith("Saved")); i++) await wait(20);
+    await until(() => ws.sent.some((m) => m.type === "status" && m.text.startsWith("Saved")));
+    // "Saved" goes out first; the past-meetings reload and then the forced rescan follow.
+    await until(() => h.events.at(-1) === "refresh!");
     expect(streams.at(-1)!.vaultNotes).toContain("## Sarah Chen (person)");
     const meetings = join(vaultDir, "Meetings");
     // Other tests save notes with the same title: pick this conversation's note by its line.
@@ -319,7 +323,7 @@ describe("Session vault recall", () => {
     vi.useRealTimers();
     h.transcript = "Okay then.";
     ws.speech(10);
-    for (let i = 0; i < 150 && !ws.sent.some((m) => m.type === "utterance" && m.text === "Okay then."); i++) await wait(20);
+    await until(() => ws.sent.some((m) => m.type === "utterance" && m.text === "Okay then."));
     expect(ws.sent).toContainEqual({ type: "utterance", text: "Okay then.", speaker: "other" });
     expect(h.events).toEqual(["stream", "refresh", "stream", "refresh", "refresh"]);
   });
@@ -375,5 +379,146 @@ describe("Session vault recall", () => {
     streams[0]!.handlers.onDelta("- Yes, this morning.");
     streams[0]!.handlers.onDone();
     expect(ws.types()).toEqual(["status", "utterance", "thinking:1", "answer_start:1", "answer_delta:1", "answer_done:1"]);
+  });
+
+  describe("vault graph", () => {
+    type Graph = Extract<ServerMessage, { type: "vault_graph" }>;
+    const graphs = (ws: FakeWs) => ws.sent.filter((m): m is Graph => m.type === "vault_graph");
+
+    it("sends the graph once to an Answers page, right after connect, and nothing to other pages", () => {
+      const ws = open("answers");
+      expect(ws.types()).toEqual(["status", "vault_graph"]);
+      const graph = graphs(ws)[0]!;
+      const titles = graph.nodes.map((n) => n.title);
+      expect(titles).toContain("Sarah Chen");
+      expect(titles).toContain("Atlas migration");
+      for (const bad of ["Secret", "Diary", "Journal", "Josh"]) expect(titles.join("|")).not.toContain(bad);
+      expect(JSON.stringify(graph)).not.toContain("ZEBULON");
+      for (const app of [null, "around", "sky"]) {
+        const other = open(app);
+        expect(other.types()).toEqual(["status"]);
+      }
+    });
+
+    it("sends a new graph after a rescan only when it changed", async () => {
+      const ws = open("answers");
+      // A forced scan under the fake clock puts the vault's last scan at "now", so the jump below passes its throttle.
+      await vault().refresh(true);
+      const file = join(vaultDir, "People", "Zed Quill.md");
+      await writeFile(file, "A new person.\n");
+      try {
+        later(2 * 3_600_000); // past any rescan throttle left by earlier tests
+        ws.text({ type: "ask", text: "And where are you based now?" });
+        streams[0]!.handlers.onNone();
+        await until(() => graphs(ws).some((g) => g.nodes.some((n) => n.title === "Zed Quill")));
+        // No graph repeats the one before it: a rescan that changed nothing sends nothing.
+        const all = graphs(ws).map((g) => JSON.stringify(g));
+        all.forEach((g, i) => i > 0 && expect(g).not.toBe(all[i - 1]));
+        expect(graphs(ws).length).toBeGreaterThan(1);
+      } finally {
+        await rm(file, { force: true });
+        await vault().refresh(true);
+      }
+    });
+
+    it("adds the node id to the cue of a person in the graph", () => {
+      const ws = open("answers");
+      ws.text({ type: "ask", text: "Hi Sarah, good to see you." });
+      const graph = graphs(ws)[0]!;
+      const sarah = graph.nodes.find((n) => n.title === "Sarah Chen")!;
+      expect(ws.cues()[0]!.id).toBe(sarah.id);
+      expect(graph.total).toEqual({ notes: expect.any(Number), people: 8 });
+      expect(ws.cues()[0]!.card).toMatchObject({ met: 1, seen: "12 Nov", open: "Send the deck" });
+      expect(ws.cues()[0]!.facts[0]).toBe("12 Nov  ·  Pricing plan with Sarah");
+      // Other pages get the cue as before, with no id.
+      const plain = open();
+      plain.text({ type: "ask", text: "Hi Sarah, good to see you." });
+      expect(plain.cues()[0]).not.toHaveProperty("id");
+    });
+
+    it("leaves the id out when the person is not a node of the graph sent", () => {
+      const ws = open("answers");
+      ws.text({ type: "ask", text: "Hi Sarah, good to see you." });
+      expect(ws.cues()[0]!.id).toBeTypeOf("number");
+      // A connection that has no graph (index unreadable at connect) has no id.
+      h.throwIndex = true;
+      const bare = open("answers");
+      h.throwIndex = false;
+      expect(graphs(bare)).toHaveLength(0);
+      bare.text({ type: "ask", text: "Hi Sarah, good to see you." });
+      expect(bare.cues()[0]).not.toHaveProperty("id");
+    });
+
+    it("lists in answer_start the titles of the notes quoted, as in the saved meeting note", async () => {
+      vi.useRealTimers();
+      const ws = open("answers");
+      h.transcript = "Did Sarah send over the deck yet?";
+      ws.speech(10);
+      ws.text({ type: "end_meeting" });
+      await until(() => streams.length > 0);
+      streams.at(-1)!.handlers.onStart();
+      const start = ws.sent.find((m) => m.type === "answer_start");
+      expect(start).toBeDefined();
+      const notes = (start as { notes?: string[] }).notes;
+      expect(notes).toContain("Sarah Chen");
+      expect(notes!.length).toBeLessThanOrEqual(6);
+      for (const title of notes!) expect(title.length).toBeLessThanOrEqual(40);
+
+      await until(() => ws.sent.some((m) => m.type === "status" && m.text.startsWith("Saved")));
+      const meetings = join(vaultDir, "Meetings");
+      const names = (await readdir(meetings)).filter((n) => n.includes("Saved talk"));
+      const texts = await Promise.all(names.map((n) => readFile(join(meetings, n), "utf8")));
+      const note = texts.find((t) => t.includes(h.transcript))!;
+      const audit = [...note.matchAll(/^- \[\[(.+)\]\]$/gm)].map((m) => m[1]!).filter((p) => p.includes("/"));
+      const expected = audit.map((path) =>
+        nodeTitle({ kind: path.startsWith("Meetings/") ? "meeting" : "note", title: path.split("/").pop()! }),
+      );
+      expect(notes).toEqual([...new Set(expected)]);
+    });
+
+    it("leaves notes out of answer_start when nothing was quoted", () => {
+      const ws = open("answers");
+      ws.text({ type: "ask", text: "What do you think about the launch date?" });
+      streams[0]!.handlers.onStart();
+      const start = ws.sent.find((m) => m.type === "answer_start")!;
+      expect(start).not.toHaveProperty("notes");
+    });
+
+    it("leaves a title that names a blocked note out of answer_start.notes, as the graph does", async () => {
+      const people = join(vaultDir, "People");
+      const meetings = join(vaultDir, "Meetings");
+      const files = [
+        join(people, "Wanda Frost.md"),
+        join(people, "Tom Reyes.md"),
+        join(meetings, "2026-11-20 14-00 Call with Wanda Frost.md"),
+      ];
+      await writeFile(files[0]!, "---\nrecall: false\n---\nPrivate.\n");
+      await writeFile(files[1]!, "Tom runs ops.\n");
+      await writeFile(files[2]!, "---\ntags: [meeting]\npeople: [Tom Reyes]\n---\n# Call with Wanda Frost\n\n## Summary\n\nTom agreed to the plan.\n");
+      try {
+        await vault().refresh(true);
+        const ws = open("answers");
+        ws.text({ type: "ask", text: "What did Tom Reyes decide about the plan?" });
+        expect(streams[0]!.vaultNotes).toContain("Tom Reyes");
+        streams[0]!.handlers.onStart();
+        const start = ws.sent.find((m) => m.type === "answer_start") as { notes?: string[] };
+        expect(start.notes).toContain("Tom Reyes");
+        expect(JSON.stringify(start)).not.toContain("Wanda");
+        expect(JSON.stringify(graphs(ws))).not.toContain("Wanda");
+      } finally {
+        for (const f of files) await rm(f, { force: true });
+        await vault().refresh(true);
+      }
+    });
+
+    it("sends no graph and still answers when the vault index throws", () => {
+      h.throwIndex = true;
+      const ws = open("answers");
+      ws.text({ type: "ask", text: "Hi Sarah, did you send the deck?" });
+      streams[0]!.handlers.onStart();
+      streams[0]!.handlers.onDelta("- Yes.");
+      streams[0]!.handlers.onDone();
+      expect(ws.types()).toEqual(["status", "utterance", "thinking:1", "answer_start:1", "answer_delta:1", "answer_done:1"]);
+    });
   });
 });

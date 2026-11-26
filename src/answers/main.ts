@@ -8,30 +8,25 @@ import {
   type EvenHubEvent,
 } from "@evenrealities/even_hub_sdk";
 import type { Box } from "../core/box";
-import { eventTypeOf } from "../core/events";
-import { ImagePipe } from "../core/imagepipe";
+import { lensCanvas, lensTiles } from "../core/board";
+import { eventTypeOf, onExit } from "../core/events";
+import { fitBytes, clockText } from "../core/text";
+import { ImagePipe, type Producer } from "../core/imagepipe";
 import { connectServer, type Server } from "../core/net";
-import { notePageFailure } from "../core/page";
+import { notePageFailure, openPage } from "../core/page";
 import { speakerCode, type ServerMessage, type Speaker } from "../core/protocol";
-import { Sigil, voiceLevel } from "./animator";
-import {
-  CARD,
-  CLOCK,
-  CUE_MS,
-  CUE_SEEN_MS,
-  QUESTION,
-  SIGIL,
-  STATUS,
-  acceptCue,
-  confirmCue,
-  fitBytes,
-  initialState,
-  screen,
-  stepCue,
-  type Cell,
-  type HudState,
-} from "./hud";
-import { TEXT_BOXES, createPage } from "./pages";
+import { playSplash } from "../core/splash";
+import { voiceLevel } from "../core/voice";
+import { LIGHT, type Cell } from "../core/hud";
+import { Voice, iconMoves, meterOf, type IconMode } from "./header";
+import { ICON, ORDER } from "./icon";
+import { drawLens, lensFps } from "./lens";
+import { CARD_LINES, QUESTION, TEXT_BOXES, pageSpec } from "./pages";
+import { ribbonColumns } from "./ribbon";
+import { buildVault } from "./vault";
+import { ENTRANCE_MS } from "./lens";
+import { CUE_MS, CUE_SEEN_MS, OPEN_MS, acceptCue, confirmCue, initialState, openRatio, screen, stepCue, type Env, type HudState, type Screen } from "./view";
+import { SARAH, boardEnv, boardVault, fakeLevel, scene } from "./demo";
 
 /** Answers: the real-time answer teleprompter, with meetings saved to Obsidian. */
 
@@ -42,14 +37,21 @@ const UPGRADE_TIMEOUT_MS = 3000;
 const RETRY_MS = 1000;
 /** No audio frame for this long while listening: re-arm the microphone once, then report it. */
 const AUDIO_STALL_MS = 10_000;
-const MIC_OFF = "MIC NOT AVAILABLE  ·  tap to retry or reopen";
+const MIC_OFF = "Mic not available  ·  tap to retry or reopen";
 /** The server's first status on every connect. */
 const GREETING = "Listening…";
 
 const state: HudState = initialState();
 let listening = true;
 let bridge: EvenAppBridge | null = null;
-const sigil = new Sigil(SIGIL);
+const voice = new Voice();
+/** The newest text screen (see cells()). */
+let current: Screen = screen(state, new Date());
+let iconMode: IconMode = "connecting";
+let iconAt = performance.now();
+let pipe: ImagePipe | null = null;
+/** The demo scene's voice is the made-up one; every other demo scene shows the board's own motion. */
+let demoVoice = false;
 let currentAnswerId = -1;
 /** The host closed the app (exit event); nothing more is sent to the glasses or the server. */
 let stopped = false;
@@ -57,6 +59,14 @@ let lastAudioAt = 0;
 /** The watchdog already re-armed the microphone once since the last frame. */
 let rearmed = false;
 const demo = new URLSearchParams(location.search).get("demo");
+/** `load=<0..1>` holds the opening at that progress (for screenshots); `load=off` skips it. */
+const loadParam = new URLSearchParams(location.search).get("load");
+const loadOff = loadParam === "off";
+const loadFrozen = loadParam !== null && !loadOff && Number.isFinite(Number(loadParam)) ? Number(loadParam) : null;
+/** When the opening began (the live page showing); null before that, and after the state left plain listening. */
+let openAt: number | null = null;
+/** When the recall view last appeared; its entrance runs from then. */
+let recallAt = 0;
 
 // ---- Phone-side page (debug view and typed questions) -------------------------
 
@@ -102,12 +112,27 @@ function cells(): Record<string, Cell> {
   if (step.seen && step.cue) server.send({ type: "recall_shown", name: step.cue.name });
   const s = screen(state, now);
   state.page = s.page;
-  sigil.setMode(s.sigil);
-  return { [STATUS.name]: s.status, [CLOCK.name]: s.clock, [QUESTION.name]: s.question, [CARD.name]: s.card };
+  current = s;
+  // Any state change ends the opening for good; it never holds back a cue or an answer.
+  if (openAt !== null && (state.mode !== "listening" && state.mode !== "connecting" || state.answer !== "" || state.cue !== null)) openAt = null;
+  if (s.icon !== iconMode) {
+    iconMode = s.icon;
+    iconAt = performance.now();
+  }
+  return {
+    status: s.status,
+    question: s.question,
+    body: s.body,
+    hint: s.hint,
+    card1: s.card[0],
+    card2: s.card[1],
+    card3: s.card[2],
+    card4: s.card[3],
+  };
 }
 
-/** The host accepted this QUESTION text: a drawn cue in it is now on the lens, and its 3 s and 10 s start. */
-function questionShown(content: string): void {
+/** The host accepted this question or card text: a drawn cue in it is now on the lens, and its 3 s and 10 s start. */
+function cueShown(content: string): void {
   const cue = confirmCue(state.cue, content, Date.now());
   if (cue === state.cue) return;
   state.cue = cue;
@@ -153,14 +178,18 @@ async function render(): Promise<void> {
   try {
     // cells() is read for each box, so a slow upgrade does not make the next box send old text.
     for (const box of TEXT_BOXES) {
-      const cell = cells()[box.name] ?? { content: "", color: 1 };
+      // The host closed the app while an earlier box was in flight: send nothing more.
+      if (stopped) break;
+      const cell = cells()[box.name] ?? { content: "", color: LIGHT.ambient };
       const done = await update(box, cell);
-      if (done && box.name === QUESTION.name) questionShown(cell.content);
+      if (done && (box === QUESTION || CARD_LINES.includes(box))) cueShown(cell.content);
       ok = done && ok;
     }
   } finally {
     rendering = false;
   }
+  // The lens follows the state: a changed state redraws it at once.
+  pipe?.poke();
   if (dirty) {
     dirty = false;
     scheduleRender();
@@ -192,7 +221,7 @@ function handleServerMessage(message: ServerMessage): void {
   switch (message.type) {
     case "status":
       showStatus(message.text);
-      if (message.text.startsWith("Saved")) toast(`SAVED  ·  ${message.text.replace(/^Saved:\s*/, "")}`, 4000);
+      if (message.text.startsWith("Saved")) toast(`Saved  ·  ${message.text.replace(/^Saved:\s*/, "")}`, 4000);
       else if (state.mode === "connecting" || state.mode === "error") setMode("listening");
       // The connect greeting while paused: the lens keeps PAUSED, because the microphone is off.
       else if (state.mode !== "paused" || message.text !== GREETING) toast(message.text);
@@ -217,6 +246,7 @@ function handleServerMessage(message: ServerMessage): void {
     case "answer_start":
       currentAnswerId = message.id;
       state.question = message.question;
+      state.notes = message.notes ?? [];
       state.answer = "";
       state.follow = true;
       state.answeredAt = null;
@@ -241,6 +271,10 @@ function handleServerMessage(message: ServerMessage): void {
       appendLog("recall", "Recall: " + message.name);
       scheduleRender();
       break;
+    case "vault_graph":
+      state.vault = message.nodes.length > 0 ? buildVault(message) : null;
+      scheduleRender();
+      break;
     case "error":
       showStatus(`Error: ${message.message}`);
       state.error = message.message;
@@ -254,10 +288,15 @@ function handleServerMessage(message: ServerMessage): void {
 // Demo scenes show sample data without the server: no socket, no form.
 const server: Server = demo
   ? { send: () => {}, sendBinary: () => {}, isOpen: () => false, close: () => {} }
-  : connectServer(handleServerMessage, (connected) => {
-      showStatus(connected ? "Connected" : "Disconnected - retrying");
-      if (!connected) setMode("connecting");
-    });
+  : connectServer(
+      handleServerMessage,
+      (connected) => {
+        showStatus(connected ? "Connected" : "Disconnected - retrying");
+        if (!connected) setMode("connecting");
+      },
+      // The server sends the vault graph only to a socket that says it is Answers.
+      "answers",
+    );
 if (demo) {
   document.getElementById("ask")?.remove();
   showStatus(`Demo scene: ${demo}`);
@@ -283,7 +322,7 @@ function roleToSpeaker(role: AudioSpeakerRole): Speaker {
 
 function forwardAudio(pcm: Uint8Array, role: AudioSpeakerRole): void {
   if (!listening) return;
-  sigil.setLevel(voiceLevel(pcm));
+  feedVoice(voiceLevel(pcm));
   if (!server.isOpen()) return;
   const frame = new Uint8Array(pcm.length + 1);
   frame[0] = speakerCode(roleToSpeaker(role));
@@ -300,6 +339,8 @@ function micFailed(): void {
 }
 
 async function setListening(on: boolean): Promise<void> {
+  // Never open the microphone after an exit.
+  if (stopped) return;
   listening = on;
   if (on) {
     lastAudioAt = Date.now();
@@ -331,11 +372,15 @@ function checkAudio(): void {
 
 /** The host is closing the app. The WebView can outlive this event, so release everything here. */
 let stopPage: (() => void) | null = null;
+/** Unsubscribes the early exit listener (see onExit). */
+let offExit: (() => void) | null = null;
 
 function shutdown(): void {
   if (stopped) return;
   stopped = true;
   listening = false;
+  offExit?.();
+  offExit = null;
   stopPage?.();
   if (renderTimer) clearTimeout(renderTimer);
   if (retryTimer) clearTimeout(retryTimer);
@@ -361,6 +406,7 @@ function handleGlassesEvent(event: EvenHubEvent): void {
       currentAnswerId = -1;
       state.answer = "";
       state.question = "";
+      state.notes = [];
       state.follow = true;
       if (state.mode === "answer" || state.mode === "error") setMode("listening");
       scheduleRender();
@@ -377,7 +423,7 @@ function handleGlassesEvent(event: EvenHubEvent): void {
       break;
     case OsEventTypeList.LONG_PRESS_EVENT:
       server.send({ type: "end_meeting" });
-      toast("SAVING TO OBSIDIAN…", 15_000);
+      toast("Saving to Obsidian…", 15_000);
       break;
     case OsEventTypeList.FOREGROUND_ENTER_EVENT:
       // Android can suspend the WebView; capture stops with it. Re-arm on return.
@@ -393,24 +439,115 @@ function handleGlassesEvent(event: EvenHubEvent): void {
   }
 }
 
+// ---- The lens ----------------------------------------------------------------
+
+const since = (): number => (performance.now() - iconAt) / 1000;
+
+/** One voice sample from the audio frames. A quiet room wakes the lens when the voice starts. */
+function feedVoice(level: number): void {
+  const wasActive = voice.active;
+  voice.push(level);
+  if (!wasActive && voice.active) pipe?.poke();
+}
+
+/** Progress of the opening, or null when it is not on. */
+const opening = (): number | null => (loadOff ? null : openRatio(state, openAt, performance.now(), loadFrozen));
+
+/** Seconds on the lens clock when the opening is frozen: inside the board's opening, after its 1.6 s logo. */
+const frozenT = (r: number): number => 1.6 + r * (OPEN_MS / 1000);
+
+/** The lens's changing parts: the clock, the voice, the opening and the recall entrance. A demo shows the board's own motion. */
+function envAt(t: number): Env {
+  const r = opening();
+  const lensT = r !== null && loadFrozen !== null ? frozenT(r) : t;
+  const base: Env = demo && !demoVoice
+    ? boardEnv(lensT)
+    : { t: lensT, clock: clockText(new Date()), meter: meterOf(voice.history), columns: ribbonColumns(voice.history), open: null, entrance: 1, since: 0, level: voice.level };
+  return { ...base, open: r, since: since(), level: demo && !demoVoice ? 0 : voice.level };
+}
+
+/** Whether the recall view was up at the last frame, to start its entrance when it appears. */
+let recallUp = false;
+let lastFps = 2;
+
+/** The lens at `t`: the model for the live state, drawn as the board draws it. */
+function lensFrame(t: number): Uint8Array {
+  const now = new Date();
+  const env = envAt(t);
+  let s = screen(state, now, env);
+  if (s.recall && !recallUp) recallAt = performance.now();
+  recallUp = s.recall !== null;
+  if (s.recall) {
+    const entrance = Math.min(1, (performance.now() - recallAt) / ENTRANCE_MS);
+    if (entrance < 1) s = screen(state, now, { ...env, entrance });
+  }
+  lastFps = lensFps(s.lens, { icon: iconMoves(iconMode), meter: voice.active });
+  const canvas = lensCanvas();
+  drawLens(canvas, s.lens, env.t);
+  return canvas.pixels;
+}
+
+/** The four tiles of the lens. A still lens costs nothing: an unchanged tile is not sent. */
+const producers = (): Producer[] => lensTiles(lensFrame, () => lastFps);
+
 // ---- Start -------------------------------------------------------------------
+
+/** The intervals a demo scene starts; stopped with the page. */
+const demoTimers: ReturnType<typeof setInterval>[] = [];
+/** The demo scene: its state, a sample graph, and (for the cue scenes) a cue that comes back after it ends. */
+function seedDemo(name: string): void {
+  const sc = scene(name, Date.now());
+  Object.assign(state, sc.state);
+  if (sc.vault) state.vault = boardVault();
+  if (sc.voice) {
+    demoVoice = true;
+    demoTimers.push(setInterval(() => feedVoice(fakeLevel(Date.now())), 100));
+  }
+  if (sc.saved) {
+    // The server's own words: the page turns them into the toast.
+    const arm = (): void => {
+      if (!state.toast || state.toast.until < Date.now()) handleServerMessage({ type: "status", text: "Saved: Pricing call with Sarah" });
+    };
+    arm();
+    demoTimers.push(setInterval(arm, 1000));
+  }
+  if (sc.cue) {
+    const arm = (): void => {
+      if (!state.cue) handleServerMessage({ type: "recall", ...SARAH, facts: [...SARAH.facts] });
+    };
+    arm();
+    demoTimers.push(setInterval(arm, 1000));
+  }
+}
 
 async function start(): Promise<void> {
   // `bridge` is set only once the page exists, so no text upgrade goes to a page that is not there yet.
   const host = await waitForEvenAppBridge();
+  // Listens from now on, so an exit during the intro or while the page is built is not lost.
+  offExit = onExit(host, shutdown);
+  // The intro owns the lens first. Nothing else sends to the glasses until it returns.
+  const intro = await playSplash(host, { name: "Answers", icon: ICON, order: ORDER });
+  if (intro.exited || stopped) return shutdown();
+  if (demo) seedDemo(demo);
+  // After the intro, so data that arrived during it is on the first page.
   const content = cells();
   // On failure, carry on: after a reload the host still holds the old page. `shown` stays empty, so every cell is sent again.
-  if (await createPage(host, content)) {
+  if (await openPage(host, pageSpec(content), intro.startedUp)) {
     for (const [name, cell] of Object.entries(content)) shown.set(name, { content: fitBytes(cell.content), color: cell.color });
-    questionShown(content[QUESTION.name]?.content ?? "");
+    for (const box of [QUESTION, ...CARD_LINES]) cueShown(content[box.name]?.content ?? "");
   } else notePageFailure();
+  // The host closed the app while the page was being built: use nothing of it.
+  if (stopped) return;
   bridge = host;
   // A state change that came while the page was created (such as the server's greeting) goes on the lens now.
   scheduleRender();
   const unsubscribe = host.onEvenHubEvent(handleGlassesEvent);
-  const pipe = new ImagePipe(host);
-  pipe.set([sigil.producer()]);
-  void pipe.run();
+  const images = new ImagePipe(host);
+  pipe = images;
+  images.set(producers());
+  void images.run();
+  // The opening starts with the live page; it plays only while the state stays plain listening.
+  openAt = performance.now();
   // Keeps the clock current, dims old answers and watches the audio.
   const tick = setInterval(() => {
     scheduleRender();
@@ -418,13 +555,15 @@ async function start(): Promise<void> {
   }, 15_000);
   stopPage = () => {
     unsubscribe();
-    pipe.stop();
+    images.stop();
     clearInterval(tick);
+    for (const timer of demoTimers) clearInterval(timer);
   };
+  // No microphone in a demo; the page just shows the scene.
+  if (demo) return;
   await setListening(true);
 }
 
-const boot = demo ? import("./demo").then((m) => m.runDemo(demo)) : start();
-boot.catch((error: unknown) => {
+start().catch((error: unknown) => {
   showStatus(`Start failed: ${error instanceof Error ? error.message : String(error)}`);
 });

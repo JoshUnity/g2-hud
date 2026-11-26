@@ -1,8 +1,9 @@
-import { chmod, cp, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MAX_LINKS, MAX_NODES, buildGraph, nodeTitle } from "../server/graph";
 import { log } from "../server/log";
 import { renderDraftHeader, renderNote } from "../server/notes";
 import {
@@ -635,5 +636,162 @@ describe("Vault refresh", () => {
     expect(vault.notes).toHaveLength(3);
     expect(vault.notes.every((n) => n.path.startsWith("People/"))).toBe(true);
     expect(vault.stats?.capped).toBe(true);
+  });
+});
+
+
+describe("vault graph", () => {
+  const graphOf = async (cfg: VaultConfig, dir?: string) => {
+    const vault = await scan(dir ? { ...cfg, root: dir } : cfg);
+    return buildGraph(vault.index!, vault.notes);
+  };
+  const titles = (g: { nodes: { title: string }[] }) => g.nodes.map((n) => n.title);
+  const WHOLE = { folders: [""], exclude: ["Journal", "Private"] };
+
+  it("lists people, then topics, then the newest meetings, with ids that are positions", async () => {
+    const g = await graphOf(config());
+    expect(g.nodes.map((n) => n.kind)).toEqual([...Array(8).fill("person"), ...Array(3).fill("topic"), ...Array(3).fill("meeting")]);
+    expect(titles(g).slice(0, 8)).toEqual(["Dana Scott", "Mark Olsen", "Priya Raman", "Robert Lane", "Sarah Chen", "Tom Baker", "Tom Hale", "Will Turner"]);
+    expect(titles(g).slice(8, 11)).toEqual(["Atlas migration", "Billing revamp", "Harbor launch"]);
+    // Newest first, without the date stamp. The recording in progress is a meeting note too.
+    expect(titles(g).slice(11)).toContain("Pricing plan with Sarah");
+    g.nodes.forEach((n, i) => expect(n.id).toBe(i));
+  });
+
+  it("leaves out blocked, unlisted, excluded, hidden, conflicted and own notes", async () => {
+    const dir = await tmpVault();
+    try {
+      await writeFile(join(dir, "People", "Josh.md"), "Me.\n");
+      await writeFile(join(dir, "Meetings", "2026-11-26 10-00 Hidden call.md"), "---\nrecall: false\ntags: [meeting]\npeople: [Sarah]\n---\n# Hidden call\n");
+      const all = [
+        ...titles(await graphOf(config(), dir)),
+        ...titles(await graphOf(config({ ...WHOLE }), dir)),
+        ...titles(await graphOf(config({ ...WHOLE, folders: [""], exclude: [] }), dir)).filter((t) => t.startsWith("Priya") || t.startsWith("Sarah Chen")),
+      ];
+      const text = all.join("|");
+      for (const bad of ["Secret", "Diary", "Journal", "Hidden", "Old Person", "conflict", "Josh", "ZEBULON"]) expect(text).not.toContain(bad);
+      // Unlisted and excluded folders: Private/Diary has the alias "Sarah", Journal/Secret names Priya.
+      const whole = titles(await graphOf(config({ ...WHOLE }), dir));
+      expect(whole).toContain("Sarah Chen");
+      expect(whole.filter((t) => t === "Sarah Chen")).toHaveLength(1);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("is dumb about content: titles and ids only", async () => {
+    const g = await graphOf(config());
+    expect(dump({ nodes: g.nodes, links: g.links })).not.toContain(MARK);
+    expect(Object.keys(g.nodes[0]!).sort()).toEqual(["id", "kind", "title"]);
+  });
+
+  it("links real wikilinks and meeting relations, once each, with no self link", async () => {
+    const g = await graphOf(config());
+    const at = (title: string) => g.nodes.find((n) => n.title === title)!.id;
+    const has = (a: string, b: string) => g.links.some(([x, y]) => (x === at(a) && y === at(b)) || (x === at(b) && y === at(a)));
+    expect(has("Atlas migration", "Tom Baker")).toBe(true); // [[Tom Baker]] in the Atlas note
+    expect(has("Pricing plan with Sarah", "Sarah Chen")).toBe(true); // meeting people
+    expect(has("Atlas migration kickoff", "Atlas migration")).toBe(true); // meeting topics
+    expect(has("Atlas migration kickoff", "Priya Raman")).toBe(true); // first name, unique
+    expect(has("Atlas migration kickoff", "Tom Baker")).toBe(false); // "Tom" is ambiguous
+    expect(has("Lunch with Dana", "Dana Scott")).toBe(true);
+    expect(new Set(g.links.map((l) => l.join(","))).size).toBe(g.links.length);
+    for (const [a, b] of g.links) {
+      expect(a).not.toBe(b);
+      expect(a).toBeGreaterThanOrEqual(0);
+      expect(b).toBeLessThan(g.nodes.length);
+    }
+  });
+
+  it("drops a meeting title that contains the name of a blocked note, and its own link to that note", async () => {
+    const dir = await tmpVault();
+    try {
+      await writeFile(join(dir, "Meetings", "2026-11-26 10-00 Call with Secret Person.md"), "---\ntags: [meeting]\npeople: [Secret Person, Sarah]\n---\n# Call\n");
+      const g = await graphOf(config(), dir);
+      expect(titles(g).join("|")).not.toContain("Secret");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("counts the notes recall may quote and the people it knows, not the wearer's own note", async () => {
+    const g = await graphOf(config());
+    expect(g.total).toEqual({ notes: 17, people: 8 });
+    expect(Object.keys(g.total).sort()).toEqual(["notes", "people"]);
+    const dir = await tmpVault();
+    try {
+      await writeFile(join(dir, "People", "Josh.md"), "Me.\n");
+      const withOwn = await graphOf(config(), dir);
+      expect(withOwn.total).toEqual(g.total);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("counts people beyond the 80 nodes of the graph", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "g2vault-"));
+    try {
+      await mkdir(join(dir, "People"));
+      for (let i = 0; i < 90; i++) await writeFile(join(dir, "People", `Person ${String.fromCharCode(97 + (i % 26))}${i}.md`), "Hi.\n");
+      const g = await graphOf(config({ folders: ["People"] }), dir);
+      expect(g.nodes).toHaveLength(MAX_NODES);
+      expect(g.total).toEqual({ notes: 90, people: 90 });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("is the same graph for the same vault", async () => {
+    const a = await graphOf(config());
+    const b = await graphOf(config());
+    expect(JSON.stringify([a.nodes, a.links])).toBe(JSON.stringify([b.nodes, b.links]));
+  });
+
+  it("caps nodes at 80 with people first, links at 240, and titles at 40 characters", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "g2vault-"));
+    try {
+      await mkdir(join(dir, "People"));
+      await mkdir(join(dir, "Projects"));
+      await mkdir(join(dir, "Meetings"));
+      const long = "Alexandria Bartholomew Cunningham Wetherby";
+      await writeFile(join(dir, "People", long + ".md"), "Long.\n");
+      for (let i = 0; i < 60; i++) {
+        const links = Array.from({ length: 12 }, (_, k) => `[[Person ${String.fromCharCode(97 + ((i + k + 1) % 26))}${(i + k + 1) % 60}]]`).join(" ");
+        await writeFile(join(dir, "People", `Person ${String.fromCharCode(97 + (i % 26))}${i}.md`), links + "\n");
+      }
+      for (let i = 0; i < 40; i++) await writeFile(join(dir, "Projects", `Project number ${i}.md`), "Plan.\n");
+      for (let i = 0; i < 20; i++) await writeFile(join(dir, "Meetings", `2026-10-${String(i + 1).padStart(2, "0")} 10-00 Sync ${i}.md`), "---\ntags: [meeting]\n---\n# Sync\n");
+      const g = await graphOf(config(), dir);
+      expect(g.nodes).toHaveLength(MAX_NODES);
+      // 61 people, then 19 topics, no meeting.
+      expect(g.nodes.filter((n) => n.kind === "person")).toHaveLength(61);
+      expect(g.nodes.filter((n) => n.kind === "topic")).toHaveLength(19);
+      expect(g.nodes.some((n) => n.kind === "meeting")).toBe(false);
+      expect(g.links.length).toBeLessThanOrEqual(MAX_LINKS);
+      expect(g.links.length).toBeGreaterThan(100);
+      const longNode = g.nodes.find((n) => n.title.startsWith("Alexandria"))!;
+      expect(longNode.title.length).toBeLessThanOrEqual(40);
+      expect(nodeTitle({ kind: "person", title: long }).length).toBe(40);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("caps links at 240 and keeps the links of people and topics before those of meetings", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "g2vault-"));
+    try {
+      await mkdir(join(dir, "People"));
+      await mkdir(join(dir, "Meetings"));
+      // 30 people who all link to each other: 435 pairs.
+      const names = Array.from({ length: 30 }, (_, i) => `Person ${String.fromCharCode(97 + (i % 26))}${i}`);
+      for (const name of names) await writeFile(join(dir, "People", name + ".md"), names.filter((n) => n !== name).map((n) => `[[${n}]]`).join(" ") + "\n");
+      await writeFile(join(dir, "Meetings", "2026-10-01 10-00 Sync.md"), `---\ntags: [meeting]\npeople: [${names[0]}]\n---\n# Sync\n`);
+      const g = await graphOf(config(), dir);
+      expect(g.links).toHaveLength(MAX_LINKS);
+      const meeting = g.nodes.find((n) => n.kind === "meeting")!.id;
+      expect(g.links.some((l) => l.includes(meeting))).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

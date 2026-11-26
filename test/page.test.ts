@@ -1,8 +1,8 @@
 import { MenuContainerProperty, MenuItemProperty, RebuildPageContainer, StartUpPageCreateResult, TextContainerProperty, type EvenAppBridge } from "@evenrealities/even_hub_sdk";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { openPage, type PageSpec } from "../src/core/page";
 
-function fakeBridge(created: StartUpPageCreateResult, rebuilt: boolean) {
+function fakeBridge(created: StartUpPageCreateResult, rebuilt: boolean | boolean[]) {
   const calls: string[] = [];
   let rebuildArg: RebuildPageContainer | null = null;
   const bridge = {
@@ -13,7 +13,7 @@ function fakeBridge(created: StartUpPageCreateResult, rebuilt: boolean) {
     rebuildPageContainer: async (c: RebuildPageContainer) => {
       calls.push("rebuild");
       rebuildArg = c;
-      return rebuilt;
+      return Array.isArray(rebuilt) ? (rebuilt.shift() ?? false) : rebuilt;
     },
   } as unknown as EvenAppBridge;
   return { bridge, calls, rebuildArg: () => rebuildArg };
@@ -43,5 +43,35 @@ describe("openPage", () => {
   it("reports false when both create and rebuild fail", async () => {
     const f = fakeBridge(StartUpPageCreateResult.invalid, false);
     expect(await openPage(f.bridge, spec)).toBe(false);
+  });
+
+  describe("after the splash (startedUp)", () => {
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+
+    it("rebuilds at once and never creates", async () => {
+      const f = fakeBridge(StartUpPageCreateResult.success, true);
+      expect(await openPage(f.bridge, spec, true)).toBe(true);
+      expect(f.calls).toEqual(["rebuild"]);
+      expect(f.rebuildArg()?.textObject?.[0]?.containerName).toBe("card");
+    });
+
+    it("tries a rebuild once more after 300 ms", async () => {
+      const f = fakeBridge(StartUpPageCreateResult.success, [false, true]);
+      const result = openPage(f.bridge, spec, true);
+      await vi.advanceTimersByTimeAsync(299);
+      expect(f.calls).toEqual(["rebuild"]);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await result).toBe(true);
+      expect(f.calls).toEqual(["rebuild", "rebuild"]);
+    });
+
+    it("reports false when both rebuilds fail", async () => {
+      const f = fakeBridge(StartUpPageCreateResult.success, false);
+      const result = openPage(f.bridge, spec, true);
+      await vi.advanceTimersByTimeAsync(300);
+      expect(await result).toBe(false);
+      expect(f.calls).toEqual(["rebuild", "rebuild"]);
+    });
   });
 });

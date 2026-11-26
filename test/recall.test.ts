@@ -1,3 +1,6 @@
+import { cp, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { log } from "../server/log";
@@ -11,6 +14,7 @@ import {
   cueFor,
   findSubjects,
   fold,
+  namesBlocked,
   type RecallIndex,
 } from "../server/recall";
 import { Vault, type VaultNote } from "../server/vault";
@@ -301,14 +305,14 @@ describe("context", () => {
 
 describe("cue", () => {
   it("cues a known person at the first mention", () => {
-    expect(tracker().observe("Hi Sarah, good to see you.", { now: NOW })).toEqual(SARAH_CUE);
+    expect(tracker().observe("Hi Sarah, good to see you.", { now: NOW })).toMatchObject(SARAH_CUE);
   });
 
   it("re-sends an unacknowledged cue after the gap, and never after shown()", () => {
     const t = tracker();
-    expect(t.observe("Hi Sarah, good to see you.", { now: NOW })).toEqual(SARAH_CUE);
+    expect(t.observe("Hi Sarah, good to see you.", { now: NOW })).toMatchObject(SARAH_CUE);
     expect(t.observe("Sarah, one more thing.", { now: NOW + 10_000 })).toBeNull();
-    expect(t.observe("Sarah, one more thing.", { now: NOW + 25_000 })).toEqual(SARAH_CUE);
+    expect(t.observe("Sarah, one more thing.", { now: NOW + 25_000 })).toMatchObject(SARAH_CUE);
     t.shown("Sarah Chen");
     expect(t.observe("Sarah, again.", { now: NOW + 60_000 })).toBeNull();
   });
@@ -322,7 +326,7 @@ describe("cue", () => {
   });
 
   it("cues a note-less person with the meeting only", () => {
-    expect(tracker().observe("I saw Dana Scott", { now: NOW })).toEqual({ name: "Dana Scott", facts: ["1 Sep  ·  Lunch with Dana"] });
+    expect(tracker().observe("I saw Dana Scott", { now: NOW })).toMatchObject({ name: "Dana Scott", facts: ["1 Sep  ·  Lunch with Dana"] });
   });
 
   it("clamps a long name and maps shown() back through it", () => {
@@ -358,10 +362,10 @@ describe("tracker state", () => {
     t.shown("Sarah Chen");
     t.reset();
     expect(t.context("So?", { now: NOW })).toEqual(NO_RECALL);
-    expect(t.observe("Hi Sarah, good to see you.", { now: NOW + 1_000 })).toEqual(SARAH_CUE);
+    expect(t.observe("Hi Sarah, good to see you.", { now: NOW + 1_000 })).toMatchObject(SARAH_CUE);
     t.reset();
     t.shown("Sarah Chen");
-    expect(t.observe("Hi Sarah, good to see you.", { now: NOW + 2_000 })).toEqual(SARAH_CUE);
+    expect(t.observe("Hi Sarah, good to see you.", { now: NOW + 2_000 })).toMatchObject(SARAH_CUE);
   });
 
   it("survives an index that throws, with one warning", () => {
@@ -404,5 +408,137 @@ describe("speed", () => {
       t.context("What did they say about the budget?", { now: NOW + i });
     }
     expect((performance.now() - start) / 1_000).toBeLessThan(5);
+  });
+});
+
+describe("graph helpers", () => {
+  it("finds the name of a blocked note in any text, whatever the case", () => {
+    expect(namesBlocked(index, "Lunch with Secret Person")).toBe(true);
+    expect(namesBlocked(index, "lunch with secret person tomorrow")).toBe(true);
+    expect(namesBlocked(index, "Lunch with Sarah Chen")).toBe(false);
+    expect(namesBlocked(index, "Atlas migration kickoff")).toBe(false);
+  });
+
+  it("tells the subject of a cue by the name that was sent", () => {
+    const t = tracker();
+    const cue = t.observe("Hi Sarah, good to see you.", { now: NOW })!;
+    const id = t.subjectOf(cue.name)!;
+    expect(index.subjects.get(id)?.name).toBe("Sarah Chen");
+    expect(t.subjectOf("Nobody")).toBeUndefined();
+  });
+});
+
+const tomNote = (title: string, extra: Partial<VaultNote> = {}): VaultNote => person(title, extra);
+
+describe("the wearer's own note and blocked names", () => {
+  const cfg = (root: string) => ({ root, folders: ["People", "Projects", "Daily", "Meetings"], exclude: [], people: ["People"], meetings: "Meetings", self: ["josh"], cue: true });
+
+  it("attaches, sends, lists and returns nothing from the own note, tasks included", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "g2own-"));
+    try {
+      await cp(FIXTURE, dir, { recursive: true });
+      await writeFile(join(dir, "People", "Josh.md"), "---\naliases: [Joshy]\n---\nOWNLEAD likes sailing.\n\n- [ ] OWNTASK call Sarah Chen about pricing\n");
+      const vault = new Vault(cfg(dir));
+      vi.spyOn(log, "info").mockImplementation(() => {});
+      await vault.refresh(true);
+      const own = vault.index!;
+      expect([...own.subjects.values()].some((s) => s.name === "Josh" || s.note?.path === "People/Josh.md")).toBe(false);
+      const t = new RecallTracker(() => own, { cue: true, topicLines: 16 });
+      const cue = t.observe("Hi Sarah, and Josh and Joshy.", { now: NOW });
+      const ctx = t.context("What did Sarah Chen say about pricing?", { now: NOW });
+      expect(ctx.text).toContain("Sarah Chen");
+      for (const text of [JSON.stringify(cue), ctx.text, JSON.stringify(ctx.paths)]) {
+        for (const bad of ["OWNTASK", "OWNLEAD", "Josh", "Joshy"]) expect(text).not.toContain(bad);
+      }
+      for (const subject of own.subjects.values()) expect(JSON.stringify(subject.tasks)).not.toContain("OWNTASK");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves a fact of a cue out when it names a blocked note", () => {
+    const person = (title: string, extra: Partial<VaultNote> = {}) => ({ ...tomNote(title), ...extra });
+    const tom = person("Tom Reyes");
+    const meeting = person("2026-11-20 Call with Secret Person", { kind: "meeting", path: "Meetings/2026-11-20 Call with Secret Person.md", people: ["Tom Reyes"] });
+    const blocked = { blocked: true as const, path: "People/Secret Person.md", kind: "person" as const, names: ["Secret Person"] };
+    const idx = buildIndex([tom, meeting], [blocked], ["josh"]);
+    const subject = [...idx.subjects.values()].find((s) => s.name === "Tom Reyes")!;
+    expect(subject.meetings).toHaveLength(1);
+    expect(cueFor(subject, new Date(NOW))?.facts.join("|") ?? "").toContain("Secret Person");
+    expect(JSON.stringify(cueFor(subject, new Date(NOW), idx))).not.toContain("Secret");
+  });
+});
+
+describe("recall card", () => {
+  const subjectOf = (name: string) => [...index.subjects.values()].find((x) => x.name === name)!;
+  const at = new Date(NOW);
+
+  it("fills every field for Sarah Chen, and keeps name and facts as before", () => {
+    const cue = cueFor(subjectOf("Sarah Chen"), at, index)!;
+    expect(cue.name).toBe("Sarah Chen");
+    expect(cue.facts).toEqual(["12 Nov  ·  Pricing plan with Sarah", "Open: Send the deck", "Head of procurement, Northwind."]);
+    expect(cue.card).toEqual({
+      lead: "Head of procurement, Northwind.",
+      met: 1,
+      seen: "12 Nov",
+      last: "12 Nov  ·  Pricing plan with Sarah",
+      open: "Send the deck",
+    });
+    // The compact cue is the same with or without the index.
+    expect(cueFor(subjectOf("Sarah Chen"), at)!.facts).toEqual(cue.facts);
+  });
+
+  it("leaves met, seen and last out for a person with no meetings", () => {
+    const cue = cueFor(subjectOf("Mark Olsen"), at, index)!;
+    expect(cue.card).toEqual({ lead: "Investor at Northwind." });
+    expect(cue.card).not.toHaveProperty("met");
+  });
+
+  it("counts every meeting that names the person, not only the newest three", () => {
+    const tom = tomNote("Tom Reyes");
+    const meetings = [1, 2, 3, 4, 5].map((n) =>
+      tomNote("2026-10-0" + n + " Sync " + n, { kind: "meeting", path: "Meetings/2026-10-0" + n + " Sync " + n + ".md", people: ["Tom Reyes"], date: Date.UTC(2026, 9, n) }),
+    );
+    const idx = buildIndex([tom, ...meetings], [], ["josh"]);
+    const subject = [...idx.subjects.values()].find((x) => x.name === "Tom Reyes")!;
+    expect(subject.meetings).toHaveLength(3);
+    expect(cueFor(subject, at, idx)!.card?.met).toBe(5);
+  });
+
+  it("drops each field that names a blocked note, and takes nothing from the own note", () => {
+    const blocked = { blocked: true as const, path: "People/Secret Person.md", kind: "person" as const, names: ["Secret Person"] };
+    const mk = (extra: Partial<VaultNote>, meeting: Partial<VaultNote>) => {
+      const tom = tomNote("Tom Reyes", extra);
+      const m = tomNote("2026-11-20 Sync", { kind: "meeting", path: "Meetings/2026-11-20 Sync.md", people: ["Tom Reyes"], date: Date.UTC(2026, 10, 20), ...meeting });
+      const idx = buildIndex([tom, m], [blocked], ["josh"]);
+      return cueFor([...idx.subjects.values()].find((x) => x.name === "Tom Reyes")!, at, idx)!;
+    };
+    const lead = mk({ lead: "Works with Secret Person." }, { tasks: ["Send the deck"] });
+    expect(lead.card).not.toHaveProperty("lead");
+    expect(lead.card?.open).toBe("Send the deck");
+    const title = mk({ lead: "Runs ops." }, { title: "2026-11-20 Call with Secret Person" });
+    expect(title.card).not.toHaveProperty("last");
+    expect(title.card?.seen).toBe("20 Nov");
+    expect(title.card?.met).toBe(1);
+    const task = mk({ lead: "Runs ops." }, { tasks: ["Ask Secret Person for the plan"] });
+    expect(task.card).not.toHaveProperty("open");
+    for (const cue of [lead, title, task]) expect(JSON.stringify(cue)).not.toContain("Secret");
+  });
+
+  it("cuts each field to its limit", () => {
+    const long = "word ".repeat(40).trim();
+    const tom = tomNote("Tom Reyes", { lead: long + "." });
+    const m = tomNote("2026-11-20 " + long, { kind: "meeting", path: "Meetings/m.md", people: ["Tom Reyes"], date: Date.UTC(2025, 10, 20), tasks: [long] });
+    const idx = buildIndex([tom, m], [], ["josh"]);
+    const card = cueFor([...idx.subjects.values()].find((x) => x.name === "Tom Reyes")!, at, idx)!.card!;
+    expect(card.lead!.length).toBeLessThanOrEqual(80);
+    expect(card.last!.length).toBeLessThanOrEqual(60);
+    expect(card.open!.length).toBeLessThanOrEqual(60);
+    expect(card.seen).toBe("20 Nov 2025");
+  });
+
+  it("travels with the cue from the tracker", () => {
+    const cue = tracker().observe("Hi Sarah, good to see you.", { now: NOW })!;
+    expect(cue.card?.met).toBe(1);
   });
 });
